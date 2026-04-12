@@ -41,10 +41,10 @@ export function MLPForwardPass() {
                     y1={y1}
                     x2={x2}
                     y2={y2}
-                    stroke="#d4d4d8"
-                    strokeWidth={0.5}
+                    stroke="#a1a1aa"
+                    strokeWidth={1.2}
                     initial={{ pathLength: 0, opacity: 0 }}
-                    animate={{ pathLength: 1, opacity: 0.3 }}
+                    animate={{ pathLength: 1, opacity: 0.6 }}
                     transition={{
                       duration: 0.5,
                       delay: li * 0.3 + 0.1,
