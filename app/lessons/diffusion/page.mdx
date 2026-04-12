@@ -1,0 +1,377 @@
+import { CodeBlock } from "@/components/ui/CodeBlock"
+import { ColabBanner } from "@/components/ui/ColabBanner"
+import { Callout } from "@/components/ui/Callout"
+import { SpiralDataset } from "@/components/diagrams/SpiralDataset"
+import { NoiseProcess } from "@/components/diagrams/NoiseProcess"
+import { DenoisingSteps } from "@/components/diagrams/DenoisingSteps"
+
+export const metadata = {
+  title: "Build a Diffusion Model — mlearn",
+  description: "Learn to build a DDPM diffusion model that generates 2D spiral patterns from pure noise.",
+};
+
+# Build a Diffusion Model
+
+You are about to build a generative model that creates data out of thin air — literally out of random noise. By the end of this lesson you will have a working DDPM (Denoising Diffusion Probabilistic Model) that learns the shape of a 2D spiral and then generates brand-new spiral points on demand. The whole thing fits in about 100 lines of PyTorch.
+
+<ColabBanner href="https://colab.research.google.com/github/YOUR_USERNAME/mlearn/blob/main/notebooks/mlearn_diffusion.ipynb" />
+
+<Callout type="info">
+**Coming from JavaScript/TypeScript?** No worries. We will explain every Python and PyTorch concept the first time it shows up. If you have written React components and Express servers, you have more than enough background for this.
+</Callout>
+
+---
+
+## What is Diffusion?
+
+Here is the core idea in one sentence: **if you can learn to reverse gradual noise corruption, you can generate data from pure noise.**
+
+Think of it like this. Imagine you take a photo and add a tiny bit of static. Then a bit more. Then more, and more, until the image is nothing but TV snow. That is the *forward process* — easy, deterministic, requires no learning.
+
+Now imagine you train a neural network to look at a noisy image and predict what it looked like one step *less* noisy. If that network is good enough, you can start from pure static and iteratively clean it up until a brand-new image appears. That is the *reverse process* — and that is what a diffusion model learns.
+
+This idea was formalized in the 2020 paper **"Denoising Diffusion Probabilistic Models"** (DDPM) by Ho, Jain, and Abbasi-Srinivasan. It built on earlier work by Sohl-Dickstein et al. (2015) but made the training simple and the results stunning.
+
+**How does it compare to other generative models?**
+
+- **GANs** (Generative Adversarial Networks) train two networks against each other — a generator and a discriminator. They produce sharp results but are notoriously finicky to train (mode collapse, training instability).
+- **VAEs** (Variational Autoencoders) learn to encode data into a latent space and decode it back. They are stable to train but tend to produce blurry outputs.
+- **Diffusion models** sidestep both problems. Training is a straightforward regression loss (predict the noise), and the iterative sampling produces high-quality results. The tradeoff is speed — sampling requires many steps. But the simplicity is remarkable.
+
+We are going to build one from scratch, and we are going to do it in 2D so you can *see* every step.
+
+---
+
+## The Spiral Dataset
+
+Before we can denoise anything, we need data to noise up. We will generate a simple 2D spiral — a set of (x, y) points that curl outward from the origin.
+
+Why 2D? Because you can plot it. When your data lives in two dimensions, there is nowhere for bugs to hide. You can scatter-plot the real data, the noisy data, and the generated data and instantly see if things are working. This is the best way to build intuition before scaling up to images.
+
+Let us start with the imports. If you are coming from the Node ecosystem, think of `pip install` as `npm install` and `import torch` as `import React`.
+
+<CodeBlock title="imports.py" language="python">
+{"import torch\nimport torch.nn as nn\nimport matplotlib.pyplot as plt\nimport numpy as np"}
+</CodeBlock>
+
+- `torch` is PyTorch, the deep learning framework. It is like TensorFlow but with a more Pythonic API.
+- `torch.nn` contains neural network building blocks — layers, loss functions, etc. Think of it as your component library.
+- `matplotlib.pyplot` is the standard Python plotting library. It is not pretty, but it gets the job done.
+- `numpy` is the array math library that everything in Python science is built on.
+
+Now let us generate the spiral:
+
+<CodeBlock title="dataset.py" language="python">
+{"def make_spiral(n_points=2000, noise=0.05):\n    \"\"\"Generate 2D spiral points.\n    \n    Returns a tensor of shape (n_points, 2) — each row is an (x, y) point.\n    \"\"\"\n    t = torch.linspace(0, 4 * np.pi, n_points)  # angle, 2 full rotations\n    r = t / (4 * np.pi)                          # radius grows with angle\n    x = r * torch.cos(t) + torch.randn(n_points) * noise\n    y = r * torch.sin(t) + torch.randn(n_points) * noise\n    data = torch.stack([x, y], dim=1)             # shape: (n_points, 2)\n    return data\n\ndataset = make_spiral()\nprint(dataset.shape)  # torch.Size([2000, 2])"}
+</CodeBlock>
+
+Let us break this down:
+
+- `torch.linspace(0, 4 * np.pi, n_points)` creates 2000 evenly spaced values from 0 to 4pi. In JS terms, it is like `Array.from({length: 2000}, (_, i) => i * 4 * Math.PI / 1999)`.
+- `r = t / (4 * np.pi)` makes the radius grow linearly from 0 to 1 as the angle increases. This is what creates the spiral shape — points curl outward.
+- `torch.cos(t)` and `torch.sin(t)` convert polar coordinates (angle, radius) to Cartesian (x, y).
+- `torch.randn(n_points) * noise` adds a small amount of Gaussian noise so the points are not perfectly on the curve. This makes the distribution more interesting.
+- `torch.stack([x, y], dim=1)` combines the two 1D tensors into one 2D tensor. Think of it as zipping two arrays into an array of pairs.
+
+Now plot it:
+
+<CodeBlock title="plot_spiral.py" language="python">
+{"plt.figure(figsize=(6, 6))\nplt.scatter(dataset[:, 0], dataset[:, 1], s=3, alpha=0.5, c='steelblue')\nplt.title('Spiral Dataset')\nplt.axis('equal')  # same scale on both axes\nplt.grid(True, alpha=0.3)\nplt.show()"}
+</CodeBlock>
+
+- `dataset[:, 0]` grabs all rows, column 0 (the x values). The `:` means "all" — like `array.map(p => p[0])` in JS.
+- `s=3` is the marker size, `alpha=0.5` is opacity, `c='steelblue'` is the color.
+- `plt.axis('equal')` ensures circles look like circles, not ovals.
+
+You should see a tight spiral curling out from the center. That is our target distribution — the thing the diffusion model will learn to generate.
+
+<SpiralDataset />
+
+<Callout type="tip">
+Try changing the number of rotations by adjusting the `4 * np.pi` constant. Use `6 * np.pi` for three rotations, or `2 * np.pi` for just one. More rotations make the task harder for the model.
+</Callout>
+
+---
+
+## The Forward Process
+
+The forward process gradually destroys the data by adding noise over T timesteps. At each step t, we add a bit more Gaussian noise according to a schedule. By the final step T, the data is indistinguishable from pure random noise.
+
+The beautiful part: we do not actually have to run through all T steps sequentially. There is a closed-form formula that lets us jump straight to any timestep t.
+
+**The noise schedule**
+
+We define a sequence of values called `beta_t` — one for each timestep. These control how much noise to add at each step. In the original DDPM paper, beta goes linearly from 0.0001 to 0.02 over T=1000 steps.
+
+<CodeBlock title="schedule.py" language="python">
+{"T = 1000  # total number of timesteps\nbeta = torch.linspace(0.0001, 0.02, T)  # noise schedule"}
+</CodeBlock>
+
+From beta we derive two more sequences:
+
+- `alpha_t = 1 - beta_t` — the fraction of signal retained at each step.
+- `alpha_bar_t = product of all alpha values from step 1 to step t` — the *cumulative* signal retention.
+
+<CodeBlock title="schedule.py" language="python">
+{"alpha = 1.0 - beta\nalpha_bar = torch.cumprod(alpha, dim=0)  # cumulative product"}
+</CodeBlock>
+
+`torch.cumprod` is the cumulative product — like `Array.reduce` but it keeps every intermediate result. So `alpha_bar[t]` equals `alpha[0] * alpha[1] * ... * alpha[t]`.
+
+At the start (t=0), `alpha_bar` is close to 1 — almost all signal is preserved. By the end (t=999), `alpha_bar` is close to 0 — almost all signal is gone.
+
+**The key equation**
+
+Here is the magic formula. To get a noisy version of `x_0` at any timestep `t`:
+
+```
+q(x_t | x_0) = N(sqrt(alpha_bar_t) * x_0, (1 - alpha_bar_t) * I)
+```
+
+In plain English: `x_t` is a Gaussian distribution centered at a scaled-down version of `x_0`, with variance that grows as `t` increases. When `alpha_bar_t` is close to 1 (early steps), the center is close to `x_0` and the variance is small — barely noisy. When `alpha_bar_t` is close to 0 (late steps), the center is near zero and the variance is near 1 — pure noise.
+
+In code, the sampling trick turns this into:
+
+```
+x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * epsilon
+```
+
+where `epsilon` is standard Gaussian noise (`torch.randn_like(x_0)`). The first term shrinks the original data, the second term adds noise. That is it.
+
+<CodeBlock title="forward.py" language="python">
+{"def forward_diffusion(x_0, t, alpha_bar):\n    \"\"\"Add noise to x_0 at timestep t.\n    \n    Args:\n        x_0: original data, shape (batch, 2)\n        t: timestep indices, shape (batch,)\n        alpha_bar: cumulative alpha schedule, shape (T,)\n    \n    Returns:\n        x_t: noisy data, shape (batch, 2)\n        noise: the noise that was added, shape (batch, 2)\n    \"\"\"\n    # Gather the alpha_bar values for each sample's timestep\n    a_bar = alpha_bar[t].unsqueeze(1)  # shape: (batch, 1)\n    \n    noise = torch.randn_like(x_0)       # sample epsilon ~ N(0, I)\n    x_t = torch.sqrt(a_bar) * x_0 + torch.sqrt(1 - a_bar) * noise\n    return x_t, noise"}
+</CodeBlock>
+
+A few things to note:
+
+- `alpha_bar[t]` uses the timestep indices to look up the right alpha_bar value for each sample. This is fancy indexing — like `t.map(i => alpha_bar[i])` in JS.
+- `.unsqueeze(1)` adds a dimension so the shape goes from `(batch,)` to `(batch, 1)`. This is needed so the multiplication broadcasts correctly across the 2 coordinates.
+- `torch.randn_like(x_0)` generates noise with the same shape as `x_0`. It is standard normal — mean 0, variance 1.
+
+Let us visualize what happens to our spiral at different noise levels:
+
+<CodeBlock title="visualize_forward.py" language="python">
+{"fig, axes = plt.subplots(1, 5, figsize=(20, 4))\nsteps = [0, 100, 300, 600, 999]\n\nfor ax, step in zip(axes, steps):\n    t = torch.full((len(dataset),), step, dtype=torch.long)\n    x_t, _ = forward_diffusion(dataset, t, alpha_bar)\n    ax.scatter(x_t[:, 0], x_t[:, 1], s=3, alpha=0.5, c='steelblue')\n    ax.set_title(f't = {step}')\n    ax.set_xlim(-3, 3)\n    ax.set_ylim(-3, 3)\n    ax.set_aspect('equal')\n    ax.grid(True, alpha=0.3)\n\nplt.tight_layout()\nplt.show()"}
+</CodeBlock>
+
+- `torch.full((len(dataset),), step, dtype=torch.long)` creates a tensor filled with the same timestep value. It is like `new Array(2000).fill(step)`.
+- `zip(axes, steps)` pairs up each subplot axis with its corresponding timestep — similar to lodash's `_.zip`.
+
+<NoiseProcess />
+
+Drag the slider above and watch the spiral dissolve into noise. At t=0 it is pristine. By t=999 it is just a blob. The forward process is our data destruction machine, and it requires zero learning.
+
+<Callout type="info">
+**Why not just add noise once?** The gradual schedule is crucial. If we slammed all the noise in at once, the reverse process would have to make one giant leap from noise to data. By spreading it over many small steps, each reverse step only needs to remove a tiny bit of noise — a much easier task for the network.
+</Callout>
+
+---
+
+## The Noise Predictor
+
+Now we need a neural network that can look at noisy data `x_t` and predict the noise `epsilon` that was added. This is the heart of the diffusion model.
+
+The network needs two inputs:
+1. `x_t` — the noisy 2D point (2 values)
+2. `t` — the timestep (tells the network how noisy the input is)
+
+**Time conditioning with sinusoidal embeddings**
+
+We cannot just feed the raw timestep integer into the network — a single number does not give the network much to work with. Instead, we use sinusoidal position embeddings (the same trick from the Transformer paper) to convert the timestep into a rich vector.
+
+<CodeBlock title="time_embed.py" language="python">
+{"def sinusoidal_embedding(t, embed_dim=64):\n    \"\"\"Convert integer timesteps to sinusoidal embeddings.\n    \n    Args:\n        t: timestep indices, shape (batch,)\n        embed_dim: dimension of the embedding\n    \n    Returns:\n        embedding, shape (batch, embed_dim)\n    \"\"\"\n    half = embed_dim // 2\n    # Frequencies: exp(-log(10000) * i / half) for i in 0..half-1\n    freqs = torch.exp(\n        -np.log(10000.0) * torch.arange(half, dtype=torch.float32) / half\n    ).to(t.device)\n    \n    # Outer product: each timestep times each frequency\n    args = t.float().unsqueeze(1) * freqs.unsqueeze(0)  # (batch, half)\n    \n    # Interleave sin and cos\n    return torch.cat([torch.sin(args), torch.cos(args)], dim=1)  # (batch, embed_dim)"}
+</CodeBlock>
+
+This produces a 64-dimensional vector for each timestep. Different timesteps map to very different vectors, which helps the network distinguish "barely noisy" from "extremely noisy."
+
+If you have seen positional encodings in Transformers, this is the exact same idea — different frequencies encode different scales of position.
+
+**The MLP architecture**
+
+Our noise predictor is a simple feedforward network (MLP — Multi-Layer Perceptron). We concatenate the 2D point with the 64D time embedding to get a 66D input, then pass it through three linear layers with ReLU activations.
+
+<CodeBlock title="model.py" language="python">
+{"class NoisePredictor(nn.Module):\n    \"\"\"MLP that predicts the noise added to a 2D point.\"\"\"\n    \n    def __init__(self, time_embed_dim=64, hidden_dim=128):\n        super().__init__()\n        self.time_embed_dim = time_embed_dim\n        \n        # Input: 2 (point coords) + 64 (time embedding) = 66\n        self.net = nn.Sequential(\n            nn.Linear(2 + time_embed_dim, hidden_dim),\n            nn.ReLU(),\n            nn.Linear(hidden_dim, hidden_dim),\n            nn.ReLU(),\n            nn.Linear(hidden_dim, 2),  # output: predicted noise (2D)\n        )\n    \n    def forward(self, x_t, t):\n        \"\"\"Predict the noise in x_t.\n        \n        Args:\n            x_t: noisy points, shape (batch, 2)\n            t: timestep indices, shape (batch,)\n        \n        Returns:\n            predicted noise, shape (batch, 2)\n        \"\"\"\n        t_emb = sinusoidal_embedding(t, self.time_embed_dim)  # (batch, 64)\n        inp = torch.cat([x_t, t_emb], dim=1)                  # (batch, 66)\n        return self.net(inp)                                    # (batch, 2)"}
+</CodeBlock>
+
+Let us unpack the PyTorch patterns here:
+
+- `nn.Module` is the base class for all neural network components in PyTorch. Think of it like React's `Component` class — you extend it and define your structure.
+- `__init__` is the constructor. You define your layers here.
+- `nn.Sequential` chains layers together — the output of each layer feeds into the next. It is like a pipeline: `input |> Linear |> ReLU |> Linear |> ReLU |> Linear |> output`.
+- `nn.Linear(in_features, out_features)` is a fully-connected layer: it multiplies by a weight matrix and adds a bias. Like `y = W @ x + b`.
+- `nn.ReLU()` is the activation function `max(0, x)`. It adds non-linearity — without it, stacking linear layers would just be one big linear layer.
+- `forward` is where computation happens. PyTorch calls this when you do `model(x_t, t)`. Think of it as the `render` method.
+- `torch.cat([a, b], dim=1)` concatenates tensors along dimension 1 (the feature dimension). It is like `a.map((row, i) => [...row, ...b[i]])`.
+
+<Callout type="tip">
+Why predict the noise instead of predicting the clean data directly? Both work in theory, but predicting noise leads to a simpler, more stable loss function. The network learns "what does randomness look like at this noise level?" rather than "what does the data look like?" — and that turns out to be an easier task.
+</Callout>
+
+---
+
+## Training
+
+Training a diffusion model is beautifully simple. The algorithm is just four steps repeated in a loop:
+
+1. Sample a batch of real data points `x_0`
+2. Sample random timesteps `t`
+3. Sample random noise `epsilon` and create noisy data `x_t`
+4. Train the network to predict `epsilon` from `x_t` and `t`
+
+The loss is plain MSE (Mean Squared Error) between the predicted noise and the actual noise. That is it. No adversarial games, no KL divergence, no ELBO tricks. Just "guess the noise."
+
+<CodeBlock title="train.py" language="python">
+{"# Hyperparameters\nbatch_size = 256\nlearning_rate = 3e-4\nn_epochs = 5000\n\n# Create model and optimizer\nmodel = NoisePredictor(time_embed_dim=64, hidden_dim=128)\noptimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)\n\n# Generate the dataset once\ndataset = make_spiral(n_points=2000)\n\nlosses = []\n\nfor epoch in range(n_epochs):\n    # 1. Sample a random batch of data points\n    idx = torch.randint(0, len(dataset), (batch_size,))\n    x_0 = dataset[idx]  # shape: (256, 2)\n    \n    # 2. Sample random timesteps for each point in the batch\n    t = torch.randint(0, T, (batch_size,))  # shape: (256,)\n    \n    # 3. Add noise to get x_t\n    x_t, noise = forward_diffusion(x_0, t, alpha_bar)\n    \n    # 4. Predict the noise and compute loss\n    noise_pred = model(x_t, t)\n    loss = nn.functional.mse_loss(noise_pred, noise)\n    \n    # Backprop and update\n    optimizer.zero_grad()  # clear old gradients\n    loss.backward()        # compute new gradients\n    optimizer.step()       # update weights\n    \n    losses.append(loss.item())\n    \n    if epoch % 500 == 0:\n        print(f'Epoch {epoch:4d} | Loss: {loss.item():.4f}')"}
+</CodeBlock>
+
+Let us walk through the training loop:
+
+- `torch.randint(0, len(dataset), (batch_size,))` picks 256 random indices — like `Array.from({length: 256}, () => Math.floor(Math.random() * 2000))`. We use these to grab a random batch from our dataset.
+- `torch.randint(0, T, (batch_size,))` picks a random timestep for each sample. This is key — each point in the batch gets noised to a different degree.
+- `nn.functional.mse_loss(pred, target)` computes the mean squared error: `mean((pred - target)^2)`. This is our entire loss function.
+- `optimizer.zero_grad()` clears the gradients from the last step. PyTorch accumulates gradients by default (useful in some advanced scenarios), so you have to manually zero them.
+- `loss.backward()` runs backpropagation — computes how each weight contributed to the loss.
+- `optimizer.step()` updates the weights using Adam (an adaptive learning rate optimizer — think of it as SGD but smarter).
+
+**Why does predicting noise work?**
+
+Here is the short version. Remember the forward process equation:
+
+```
+x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * epsilon
+```
+
+If you know `x_t`, `t`, and `epsilon`, you can solve for `x_0`. So predicting the noise is equivalent to predicting the clean data — it is just a reparameterization. The DDPM paper showed that this noise-prediction formulation gives a loss that is equivalent to a variational lower bound on the data log-likelihood, but with lower variance. Translation: it trains more stably.
+
+Now let us plot the training loss to make sure the model is learning:
+
+<CodeBlock title="plot_loss.py" language="python">
+{"plt.figure(figsize=(10, 4))\nplt.plot(losses, alpha=0.3, color='steelblue')\n\n# Plot a smoothed version for clarity\nwindow = 100\nif len(losses) >= window:\n    smoothed = np.convolve(losses, np.ones(window) / window, mode='valid')\n    plt.plot(range(window - 1, len(losses)), smoothed, color='darkblue', linewidth=2)\n\nplt.xlabel('Epoch')\nplt.ylabel('MSE Loss')\nplt.title('Training Loss')\nplt.grid(True, alpha=0.3)\nplt.show()"}
+</CodeBlock>
+
+You should see the loss drop quickly at first and then slowly decrease. It will not hit zero — there is inherent randomness in the noise prediction task. A final loss around 0.4-0.6 is typical for this dataset. If it is much higher, try increasing `hidden_dim` or `n_epochs`.
+
+<Callout type="warning">
+**Training too short?** If your generated samples (next section) look like a random blob, try training for more epochs. 5000 is usually enough for the spiral, but 10000 will give cleaner results. You can also try lowering the learning rate to `1e-4` for the last phase of training.
+</Callout>
+
+---
+
+## Sampling
+
+This is the payoff. We trained the model to predict noise — now we use it to generate data from scratch.
+
+The DDPM sampling algorithm starts from pure Gaussian noise `x_T` and iteratively denoises it, one step at a time, from t=T-1 down to t=0. At each step, the model predicts the noise in the current `x_t`, and we subtract a scaled version of that prediction to get a slightly cleaner `x_{t-1}`.
+
+Here is the algorithm:
+
+1. Sample `x_T` from N(0, I) — pure noise
+2. For t = T-1, T-2, ..., 1, 0:
+   - Predict noise: `epsilon_pred = model(x_t, t)`
+   - Compute the mean of `x_{t-1}` using `epsilon_pred`
+   - Add a small amount of fresh noise (except at the final step t=0)
+3. Return `x_0` — your generated data
+
+<CodeBlock title="sample.py" language="python">
+{"@torch.no_grad()  # disable gradient tracking — we are not training\ndef sample(model, n_samples, T, beta, alpha, alpha_bar):\n    \"\"\"Generate samples by running the reverse diffusion process.\n    \n    Args:\n        model: trained noise predictor\n        n_samples: how many points to generate\n        T: number of timesteps\n        beta, alpha, alpha_bar: noise schedule tensors\n    \n    Returns:\n        generated points, shape (n_samples, 2)\n    \"\"\"\n    # Start from pure noise\n    x = torch.randn(n_samples, 2)\n    \n    for t_val in reversed(range(T)):\n        # Create a batch of the current timestep\n        t = torch.full((n_samples,), t_val, dtype=torch.long)\n        \n        # Predict the noise\n        eps_pred = model(x, t)\n        \n        # Compute coefficients\n        a = alpha[t_val]\n        a_bar = alpha_bar[t_val]\n        b = beta[t_val]\n        \n        # Compute the mean of x_{t-1}\n        # This is the DDPM reverse step formula:\n        # mu = (1 / sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - alpha_bar_t)) * eps_pred)\n        mean = (1 / torch.sqrt(a)) * (x - (b / torch.sqrt(1 - a_bar)) * eps_pred)\n        \n        # Add noise (except at the final step)\n        if t_val > 0:\n            noise = torch.randn_like(x)\n            sigma = torch.sqrt(b)  # standard deviation\n            x = mean + sigma * noise\n        else:\n            x = mean  # final step: no noise added\n    \n    return x"}
+</CodeBlock>
+
+Let us break down the key formula:
+
+```
+mean = (1 / sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - alpha_bar_t)) * eps_pred)
+```
+
+This comes from Bayes' rule applied to the forward process. In plain English: take the current noisy point, subtract the predicted noise (scaled appropriately), and rescale. The network is telling us "I think this much of what you see is noise," and we remove it.
+
+The `if t_val > 0` check is important. During intermediate steps we add a small amount of fresh noise — this is the stochastic part that makes DDPM a probabilistic model. At the very last step we skip the noise so the output is clean.
+
+<Callout type="info">
+`@torch.no_grad()` is a decorator that tells PyTorch not to track operations for gradient computation. During sampling we are not training, so we do not need gradients. This saves memory and speeds things up significantly. It is like wrapping a section of code in a "read-only" mode.
+</Callout>
+
+Now let us generate some spirals and see how they look:
+
+<CodeBlock title="generate.py" language="python">
+{"model.eval()  # set model to evaluation mode\n\n# Generate 2000 points\ngenerated = sample(model, n_samples=2000, T=T, beta=beta, alpha=alpha, alpha_bar=alpha_bar)\n\n# Plot real vs generated side by side\nfig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))\n\nax1.scatter(dataset[:, 0], dataset[:, 1], s=3, alpha=0.5, c='steelblue')\nax1.set_title('Real Spiral')\nax1.set_xlim(-1.5, 1.5)\nax1.set_ylim(-1.5, 1.5)\nax1.set_aspect('equal')\nax1.grid(True, alpha=0.3)\n\nax2.scatter(generated[:, 0], generated[:, 1], s=3, alpha=0.5, c='coral')\nax2.set_title('Generated Spiral')\nax2.set_xlim(-1.5, 1.5)\nax2.set_ylim(-1.5, 1.5)\nax2.set_aspect('equal')\nax2.grid(True, alpha=0.3)\n\nplt.tight_layout()\nplt.show()"}
+</CodeBlock>
+
+- `model.eval()` switches the model from training mode to evaluation mode. For our simple MLP it does not change behavior, but it is good practice — some layers (like Dropout and BatchNorm) behave differently during training vs evaluation.
+- We plot real and generated data side by side so you can compare. The generated points should form a spiral pattern similar to the real data.
+
+Let us also visualize the denoising process itself — watching noise turn into a spiral:
+
+<CodeBlock title="visualize_denoising.py" language="python">
+{"@torch.no_grad()\ndef sample_with_history(model, n_samples, T, beta, alpha, alpha_bar, save_every=100):\n    \"\"\"Sample and save intermediate steps for visualization.\"\"\"\n    x = torch.randn(n_samples, 2)\n    history = [x.clone()]\n    \n    for t_val in reversed(range(T)):\n        t = torch.full((n_samples,), t_val, dtype=torch.long)\n        eps_pred = model(x, t)\n        \n        a = alpha[t_val]\n        a_bar = alpha_bar[t_val]\n        b = beta[t_val]\n        \n        mean = (1 / torch.sqrt(a)) * (x - (b / torch.sqrt(1 - a_bar)) * eps_pred)\n        \n        if t_val > 0:\n            x = mean + torch.sqrt(b) * torch.randn_like(x)\n        else:\n            x = mean\n        \n        if t_val % save_every == 0:\n            history.append(x.clone())\n    \n    return history\n\nhistory = sample_with_history(model, 1000, T, beta, alpha, alpha_bar, save_every=100)\n\nfig, axes = plt.subplots(1, len(history), figsize=(3 * len(history), 3))\nfor i, (ax, snap) in enumerate(zip(axes, history)):\n    ax.scatter(snap[:, 0], snap[:, 1], s=2, alpha=0.5, c='steelblue')\n    step = T - i * 100 if i > 0 else T\n    ax.set_title(f't={max(0, step)}')\n    ax.set_xlim(-3, 3)\n    ax.set_ylim(-3, 3)\n    ax.set_aspect('equal')\n    ax.grid(True, alpha=0.3)\n\nplt.tight_layout()\nplt.show()"}
+</CodeBlock>
+
+<DenoisingSteps />
+
+Use the slider above to scrub through the denoising process. Watch how the random cloud of points gradually organizes itself into a spiral. The model is not memorizing specific points — it has learned the *distribution* and is generating entirely new points that follow the same pattern.
+
+This is the magic of diffusion. A simple noise prediction task, repeated many times, produces structured data from chaos.
+
+---
+
+## Experiments
+
+You have a working diffusion model. Now let us push it further. The spiral is just one 2D distribution — the same code works on anything you can scatter-plot.
+
+**Moons dataset**
+
+Two interleaving half-circles (a classic ML benchmark):
+
+<CodeBlock title="moons.py" language="python">
+{"from sklearn.datasets import make_moons\n\ndef make_moons_dataset(n_points=2000):\n    \"\"\"Generate two interleaving half-circles.\"\"\"\n    data, _ = make_moons(n_samples=n_points, noise=0.05)\n    data = torch.tensor(data, dtype=torch.float32)\n    # Center and scale the data\n    data = (data - data.mean(dim=0)) / data.std(dim=0) * 0.5\n    return data\n\ndataset = make_moons_dataset()"}
+</CodeBlock>
+
+<Callout type="info">
+`sklearn` (scikit-learn) is a popular Python ML library that includes handy dataset generators. Install it with `pip install scikit-learn`. The `make_moons` function returns both the points and class labels — we ignore the labels with `_` (a Python convention for unused variables).
+</Callout>
+
+**Circles dataset**
+
+Concentric circles:
+
+<CodeBlock title="circles.py" language="python">
+{"from sklearn.datasets import make_circles\n\ndef make_circles_dataset(n_points=2000):\n    \"\"\"Generate two concentric circles.\"\"\"\n    data, _ = make_circles(n_samples=n_points, noise=0.03, factor=0.5)\n    data = torch.tensor(data, dtype=torch.float32)\n    data = (data - data.mean(dim=0)) / data.std(dim=0) * 0.5\n    return data\n\ndataset = make_circles_dataset()"}
+</CodeBlock>
+
+**Figure-8 (lemniscate)**
+
+A figure-eight shape using parametric equations:
+
+<CodeBlock title="figure8.py" language="python">
+{"def make_figure8(n_points=2000, noise=0.03):\n    \"\"\"Generate points along a figure-8 (lemniscate) shape.\"\"\"\n    t = torch.linspace(0, 2 * np.pi, n_points)\n    x = torch.sin(t) + torch.randn(n_points) * noise\n    y = torch.sin(t) * torch.cos(t) + torch.randn(n_points) * noise\n    data = torch.stack([x, y], dim=1)\n    data = data * 0.5  # scale down\n    return data\n\ndataset = make_figure8()"}
+</CodeBlock>
+
+**Swapping datasets is trivial.** Just replace the `dataset = make_spiral()` line in the training script with any of the functions above. Everything else stays the same — the forward process, the model architecture, the training loop, the sampling code. The model does not know or care what shape the data has. It just learns to reverse noise.
+
+<CodeBlock title="experiment.py" language="python">
+{"# Pick your dataset\n# dataset = make_spiral()\n# dataset = make_moons_dataset()\n# dataset = make_circles_dataset()\ndataset = make_figure8()\n\n# Train (same code as before)\nmodel = NoisePredictor(time_embed_dim=64, hidden_dim=128)\noptimizer = torch.optim.Adam(model.parameters(), lr=3e-4)\n\nfor epoch in range(5000):\n    idx = torch.randint(0, len(dataset), (256,))\n    x_0 = dataset[idx]\n    t = torch.randint(0, T, (256,))\n    x_t, noise = forward_diffusion(x_0, t, alpha_bar)\n    noise_pred = model(x_t, t)\n    loss = nn.functional.mse_loss(noise_pred, noise)\n    optimizer.zero_grad()\n    loss.backward()\n    optimizer.step()\n\n# Sample and plot\nmodel.eval()\ngenerated = sample(model, 2000, T, beta, alpha, alpha_bar)\n\nfig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))\nax1.scatter(dataset[:, 0], dataset[:, 1], s=3, alpha=0.5, c='steelblue')\nax1.set_title('Real Data')\nax1.set_aspect('equal')\nax1.grid(True, alpha=0.3)\n\nax2.scatter(generated[:, 0], generated[:, 1], s=3, alpha=0.5, c='coral')\nax2.set_title('Generated Data')\nax2.set_aspect('equal')\nax2.grid(True, alpha=0.3)\n\nplt.tight_layout()\nplt.show()"}
+</CodeBlock>
+
+<Callout type="tip">
+**Ideas to explore:**
+- **Change the network size.** Try `hidden_dim=256` or add a third hidden layer. Does it learn faster? Produce better samples?
+- **Change the noise schedule.** Try a cosine schedule instead of linear — the Improved DDPM paper found this works better. Replace `torch.linspace(0.0001, 0.02, T)` with a cosine-based formula.
+- **Reduce T.** Can you get away with T=200 instead of 1000? How does sample quality change?
+- **Mix distributions.** Generate a dataset that combines a spiral and a circle. Can the model learn both?
+- **Track density.** The spiral has higher density near the center. Does the model capture this?
+</Callout>
+
+---
+
+That is a complete DDPM from scratch. In about 100 lines of PyTorch you built a model that generates structured data from random noise. The same principles scale up to images (just swap the MLP for a U-Net), audio, video, and 3D shapes. Stable Diffusion, DALL-E, and Midjourney all use this foundation — they just add a lot more architecture and data on top.
+
+The key takeaways:
+
+- **Forward process:** gradually add noise according to a schedule. No learning required.
+- **Training:** predict the noise at any timestep. Simple MSE loss.
+- **Sampling:** start from noise, iteratively denoise using the trained model.
+- **The schedule matters.** The beta values control how fast noise is added and removed.
+- **Diffusion is flexible.** The same algorithm works on any data distribution.
+
+Open the Colab notebook and start experimenting. Break things. Change numbers. Plot everything. That is how the intuition sticks.

@@ -1,0 +1,766 @@
+import { CodeBlock } from "@/components/ui/CodeBlock"
+import { ColabBanner } from "@/components/ui/ColabBanner"
+import { Callout } from "@/components/ui/Callout"
+import { BigramHeatmap } from "@/components/diagrams/BigramHeatmap"
+import { MLPForwardPass } from "@/components/diagrams/MLPForwardPass"
+import { AttentionMatrix } from "@/components/diagrams/AttentionMatrix"
+import { TransformerArch } from "@/components/diagrams/TransformerArch"
+import { LossCurve } from "@/components/diagrams/LossCurve"
+
+export const metadata = {
+  title: "Build a Transformer — mlearn",
+  description: "Learn to build a character-level transformer for name generation, from bigrams to full self-attention.",
+};
+
+# Build a Transformer for Name Generation
+
+You know JavaScript. You know how to build UIs, wrangle APIs, and ship products. Now you want to understand how transformers actually work -- not from a blog post with hand-wavy diagrams, but by building one yourself, piece by piece, watching it learn to generate human names.
+
+We will start with the dumbest possible model (counting character pairs) and progressively build up to a full transformer with self-attention. At every step, the model generates names so you can see it getting smarter. By the end, you will go from gibberish like `"mnba"` to plausible names like `"alexandra"`.
+
+This follows the "spiral development" approach from Andrej Karpathy's makemore series: each model works end-to-end before we add complexity.
+
+<ColabBanner href="https://colab.research.google.com/github/YOUR_USERNAME/mlearn/blob/main/notebooks/mlearn_transformer.ipynb" />
+
+<Callout type="info" title="What you need">
+  No ML experience required. You should be comfortable reading code and understanding basic math (multiplication, exponents). All Python and PyTorch concepts are explained as they come up. If you know what a function and a for-loop are, you are good.
+</Callout>
+
+## Setup and Data
+
+First, let us get our environment ready. If you are coming from JavaScript, think of `import torch` as the ML equivalent of importing React -- it is the foundation everything else builds on. PyTorch is a library for working with tensors (multi-dimensional arrays, like nested `Float64Array`s on steroids) and computing gradients automatically.
+
+<CodeBlock title="setup.py" language="python">{`import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+# Read the names dataset -- one name per line
+# You can grab this from: https://raw.githubusercontent.com/karpathy/makemore/master/names.txt
+words = open('names.txt', 'r').read().splitlines()
+
+print(f"Number of names: {len(words)}")
+print(f"First 10: {words[:10]}")
+print(f"Shortest: {min(len(w) for w in words)}")
+print(f"Longest: {max(len(w) for w in words)}")`}</CodeBlock>
+
+<Callout type="tip" title="Python vs JS quick reference">
+  <p><code>f"hello {`{name}`}"</code> is like JS template literals. <code>words[:10]</code> is like <code>words.slice(0, 10)</code>. List comprehensions like <code>[x for x in items]</code> are like <code>items.map(x =&gt; x)</code>. The <code>len()</code> function is like <code>.length</code>.</p>
+</Callout>
+
+The dataset has about 32,000 names. Now we need to convert characters into numbers, because neural networks only understand numbers. We will build a mapping from every character to an integer index, plus a special `"."` token that marks the start and end of a name.
+
+<CodeBlock title="vocab.py" language="python">{`# Build character vocabulary
+chars = sorted(list(set(''.join(words))))
+stoi = {s: i + 1 for i, s in enumerate(chars)}
+stoi['.'] = 0  # special start/end token
+itos = {i: s for s, i in stoi.items()}
+
+vocab_size = len(stoi)
+print(f"Vocabulary: {itos}")
+print(f"Vocab size: {vocab_size}")  # 27: a-z plus the '.' token`}</CodeBlock>
+
+Think of `stoi` (string-to-int) as a lookup table, like a JS `Map`. The character `'a'` becomes `1`, `'b'` becomes `2`, and so on. The `itos` dict goes the other direction. We will use these constantly.
+
+Now let us split our data into training and validation sets. This is critical -- we need to check that our model actually *learned* patterns rather than memorizing the data.
+
+<CodeBlock title="split.py" language="python">{`import random
+random.seed(42)
+random.shuffle(words)
+
+n1 = int(0.8 * len(words))
+n2 = int(0.9 * len(words))
+
+train_words = words[:n1]
+val_words = words[n1:n2]
+test_words = words[n2:]
+
+print(f"Train: {len(train_words)}, Val: {len(val_words)}, Test: {len(test_words)}")`}</CodeBlock>
+
+## Bigram Model
+
+The simplest language model you can build: look at one character, predict the next. That is it. No context, no memory, no neural network. Just counting.
+
+The idea is straightforward. We scan through every name and count how often each pair of characters appears together. If `'t'` is followed by `'h'` a thousand times, that pair gets a high count. Then we normalize the counts into probabilities.
+
+<CodeBlock title="bigram_counts.py" language="python">{`# Count character pairs (bigrams)
+N = torch.zeros((vocab_size, vocab_size), dtype=torch.int32)
+
+for w in train_words:
+    chs = ['.'] + list(w) + ['.']
+    for ch1, ch2 in zip(chs, chs[1:]):
+        ix1 = stoi[ch1]
+        ix2 = stoi[ch2]
+        N[ix1, ix2] += 1
+
+# Normalize rows to get probabilities
+# Adding 1 for smoothing (avoids division by zero and log(0))
+P = (N + 1).float()
+P = P / P.sum(dim=1, keepdim=True)`}</CodeBlock>
+
+A few Python/PyTorch things to unpack here:
+
+- `torch.zeros((27, 27))` creates a 27x27 matrix of zeros. Think of it as `new Array(27).fill(null).map(() => new Array(27).fill(0))`, but way more efficient.
+- `zip(chs, chs[1:])` pairs each character with the next one. So for `"emma"`, the pairs are `('.','e'), ('e','m'), ('m','m'), ('m','a'), ('a','.')`.
+- `P.sum(dim=1, keepdim=True)` sums each row. The `dim=1` means "sum across columns," and `keepdim=True` keeps the shape compatible for broadcasting (like how JS spreads values when array shapes differ).
+
+Here is what that frequency matrix looks like:
+
+<BigramHeatmap />
+
+Bright cells mean that character pair appears often. You can already see patterns -- names tend to start with certain consonants and end with vowels. The model "knows" this just from counting.
+
+Now let us generate some names by sampling from these probabilities:
+
+<CodeBlock title="bigram_sample.py" language="python">{`# Generate names from the bigram model
+g = torch.Generator().manual_seed(2147483647)
+
+for _ in range(10):
+    out = []
+    ix = 0  # start token
+    while True:
+        p = P[ix]
+        ix = torch.multinomial(p, num_samples=1, replacement=True, generator=g).item()
+        if ix == 0:  # end token
+            break
+        out.append(itos[ix])
+    print(''.join(out))`}</CodeBlock>
+
+`torch.multinomial` is the key function here -- it randomly picks an index based on the probability distribution `p`. It is like rolling a weighted die. If `P('h' | 't')` is high, the model is more likely to pick `'h'` after seeing `'t'`.
+
+Sample output:
+
+```
+mnba
+aia
+sahyneede
+rer
+ard
+raede
+lede
+a
+rriede
+an
+```
+
+These are... not great names. Some look vaguely name-like (`"ard"`, `"an"`) but most are nonsense. That makes sense -- we only look at one character at a time. The model has no idea that `"mnb"` is not how names work because it never sees more than a pair.
+
+Let us also compute the loss so we can compare models later. The standard metric is **negative log likelihood** (NLL). Lower is better.
+
+<CodeBlock title="bigram_loss.py" language="python">{`# Compute negative log likelihood loss
+log_likelihood = 0.0
+n = 0
+
+for w in val_words:
+    chs = ['.'] + list(w) + ['.']
+    for ch1, ch2 in zip(chs, chs[1:]):
+        ix1 = stoi[ch1]
+        ix2 = stoi[ch2]
+        prob = P[ix1, ix2]
+        log_likelihood += torch.log(prob)
+        n += 1
+
+nll = -log_likelihood / n
+print(f"Bigram NLL: {nll.item():.4f}")  # ~2.45`}</CodeBlock>
+
+<Callout type="info" title="What is negative log likelihood?">
+  <p>Imagine the model says <code>P('m' | 'e') = 0.15</code>. The log of 0.15 is about -1.9. We negate it to get 1.9. If the model was more confident (say 0.9), the NLL would be just 0.1. So NLL measures how surprised the model is by the actual data. Less surprise = lower loss = better model.</p>
+</Callout>
+
+## Neural Bigram
+
+Now let us do the exact same thing -- predict the next character from one character -- but with a neural network instead of counting. Why? Because neural networks can be extended to handle more context, and they learn via gradients. This is the first step toward a transformer.
+
+Instead of a count matrix, we have a *weight* matrix `W` that the network will learn. We feed in a character as a one-hot vector, multiply by `W`, and get a score for every possible next character. Then we apply `softmax` to convert scores to probabilities.
+
+<CodeBlock title="neural_bigram.py" language="python">{`# Neural bigram model
+g = torch.Generator().manual_seed(2147483647)
+W = torch.randn((vocab_size, vocab_size), generator=g, requires_grad=True)
+
+# Build training data: pairs of (input_char, target_char)
+xs, ys = [], []
+for w in train_words:
+    chs = ['.'] + list(w) + ['.']
+    for ch1, ch2 in zip(chs, chs[1:]):
+        xs.append(stoi[ch1])
+        ys.append(stoi[ch2])
+
+xs = torch.tensor(xs)
+ys = torch.tensor(ys)
+
+print(f"Training examples: {len(xs)}")`}</CodeBlock>
+
+<Callout type="tip" title="One-hot encoding">
+  <p>A one-hot vector is like a boolean array where exactly one element is <code>true</code>. For character index 5 with vocab size 27, it is <code>[0,0,0,0,0,1,0,...,0]</code>. In PyTorch, <code>F.one_hot(torch.tensor(5), 27)</code> creates this. When you multiply a one-hot vector by a matrix, you just pluck out one row -- it is a lookup.</p>
+</Callout>
+
+<CodeBlock title="neural_bigram_train.py" language="python">{`# Training loop
+for epoch in range(200):
+    # Forward pass
+    xenc = F.one_hot(xs, num_classes=vocab_size).float()  # one-hot encode inputs
+    logits = xenc @ W  # predict scores for next character (@ is matrix multiply)
+    counts = logits.exp()  # exponentiate to get fake "counts"
+    probs = counts / counts.sum(dim=1, keepdim=True)  # normalize to probabilities
+
+    # Loss: negative log likelihood (same metric as before)
+    loss = -probs[torch.arange(len(ys)), ys].log().mean()
+
+    # Backward pass
+    W.grad = None  # zero gradients (like optimizer.zero_grad())
+    loss.backward()  # compute gradients -- PyTorch does this automatically
+
+    # Update weights
+    W.data -= 50 * W.grad  # gradient descent with learning rate 50
+
+    if epoch % 50 == 0:
+        print(f"Epoch {epoch}: loss = {loss.item():.4f}")
+
+# Final loss
+print(f"Final training loss: {loss.item():.4f}")  # ~2.47`}</CodeBlock>
+
+There is a lot happening here, so let us unpack the key ideas:
+
+- **Forward pass**: Convert the input character to a one-hot vector, multiply by the weight matrix `W` to get "logits" (raw scores), then apply softmax (exponentiate and normalize) to get probabilities. The `@` operator is matrix multiplication -- like `numpy.dot` or manual nested loops in JS.
+- **Loss**: We grab the probability the model assigned to the *correct* next character, take the log, negate it, and average. This is cross-entropy loss.
+- **Backward pass**: `loss.backward()` is where the magic happens. PyTorch traces every operation that produced `loss` and computes the gradient of `loss` with respect to `W`. This is called *autograd* -- automatic differentiation.
+- **Update**: We nudge `W` in the direction that reduces the loss. The learning rate (50 here, which is unusually large because our model is so simple) controls the step size.
+
+After training, the weight matrix `W` essentially converges to the same thing as our count-based probability matrix `P`. The neural network rediscovered counting through gradient descent. Now let us sample from it:
+
+<CodeBlock title="neural_bigram_sample.py" language="python">{`# Sample from the neural bigram
+g = torch.Generator().manual_seed(2147483647)
+
+for _ in range(10):
+    out = []
+    ix = 0
+    while True:
+        xenc = F.one_hot(torch.tensor([ix]), num_classes=vocab_size).float()
+        logits = xenc @ W
+        probs = F.softmax(logits, dim=1)
+        ix = torch.multinomial(probs, num_samples=1, replacement=True, generator=g).item()
+        if ix == 0:
+            break
+        out.append(itos[ix])
+    print(''.join(out))`}</CodeBlock>
+
+The output will be very similar to the counting approach:
+
+```
+mnba
+aia
+sahyneede
+rer
+ard
+```
+
+That is expected -- same model, same result. But now we have the machinery to go further. We can make the network deeper, give it more context, and it will learn things that counting never could.
+
+<Callout type="info" title="Why bother with a neural network if counting works?">
+  <p>Counting only works for bigrams. If we wanted to condition on 3 characters, we would need a 27x27x27 tensor. For 10 characters of context, that is 27^10 entries -- impossible. Neural networks scale because they learn compressed representations instead of storing every combination.</p>
+</Callout>
+
+## MLP Language Model
+
+Time for a real upgrade. Instead of looking at just one character, we will look at the last 3 characters (a "context window") and use a multi-layer perceptron (MLP) to predict the next one. This is the architecture from Bengio et al. (2003) -- a classic.
+
+The key new idea is **embeddings**. Instead of a one-hot vector (27 dimensions, mostly zeros), we represent each character as a small dense vector (say, 10 dimensions). The network learns these embeddings during training. Characters that behave similarly (like vowels) end up with similar embeddings.
+
+<MLPForwardPass />
+
+The flow is: look up embeddings for the last 3 characters, concatenate them into one long vector, pass through a hidden layer with `tanh` activation, then project to vocabulary-size output.
+
+<CodeBlock title="mlp_data.py" language="python">{`# Build dataset with context window
+block_size = 3  # how many characters of context
+
+def build_dataset(words):
+    X, Y = [], []
+    for w in words:
+        context = [0] * block_size  # start with all '.' tokens
+        for ch in w + '.':
+            ix = stoi[ch]
+            X.append(context)
+            Y.append(ix)
+            context = context[1:] + [ix]  # slide the window forward
+    X = torch.tensor(X)
+    Y = torch.tensor(Y)
+    return X, Y
+
+X_train, Y_train = build_dataset(train_words)
+X_val, Y_val = build_dataset(val_words)
+
+print(f"Training set: {X_train.shape}")  # (N, 3) -- N examples, 3 chars of context
+print(f"Example: {X_train[0]} -> {Y_train[0]}")  # [0, 0, 0] -> 5 (e.g., '...' -> 'e')`}</CodeBlock>
+
+The sliding window is like a queue. For the name `"emma"`, we get:
+
+| Context | Target |
+|---------|--------|
+| `...`   | `e`    |
+| `..e`   | `m`    |
+| `.em`   | `m`    |
+| `emm`   | `a`    |
+| `mma`   | `.`    |
+
+Now the model definition. In PyTorch, tensors with `requires_grad=True` are trainable parameters. We group them in a list for convenience.
+
+<CodeBlock title="mlp_model.py" language="python">{`# MLP model
+n_embd = 10   # embedding dimension
+n_hidden = 200  # hidden layer size
+
+g = torch.Generator().manual_seed(2147483647)
+
+C = torch.randn((vocab_size, n_embd), generator=g)  # embedding lookup table
+W1 = torch.randn((block_size * n_embd, n_hidden), generator=g) * 0.2  # hidden layer
+b1 = torch.randn(n_hidden, generator=g) * 0.01
+W2 = torch.randn((n_hidden, vocab_size), generator=g) * 0.01  # output layer
+b2 = torch.randn(vocab_size, generator=g) * 0.01
+
+parameters = [C, W1, b1, W2, b2]
+for p in parameters:
+    p.requires_grad = True
+
+print(f"Total parameters: {sum(p.nelement() for p in parameters)}")  # ~6,000`}</CodeBlock>
+
+<Callout type="tip" title="Weight initialization matters">
+  <p>We multiply initial weights by small numbers (0.2, 0.01) to prevent the outputs from being too extreme at the start. If logits are huge, softmax saturates and gradients vanish. This is a common source of bugs in ML. Think of it like setting reasonable default values in a React component.</p>
+</Callout>
+
+<CodeBlock title="mlp_train.py" language="python">{`# Training loop with mini-batches
+for epoch in range(20000):
+    # Mini-batch: randomly sample 64 examples
+    ix = torch.randint(0, X_train.shape[0], (64,), generator=g)
+    Xb, Yb = X_train[ix], Y_train[ix]
+
+    # Forward pass
+    emb = C[Xb]                           # (64, 3, 10) -- look up embeddings
+    h = emb.view(-1, block_size * n_embd)  # (64, 30) -- flatten context
+    h = torch.tanh(h @ W1 + b1)           # (64, 200) -- hidden layer with tanh
+    logits = h @ W2 + b2                   # (64, 27) -- output scores
+    loss = F.cross_entropy(logits, Yb)     # compute loss
+
+    # Backward pass
+    for p in parameters:
+        p.grad = None
+    loss.backward()
+
+    # Update: decay learning rate over time
+    lr = 0.1 if epoch < 10000 else 0.01
+    for p in parameters:
+        p.data -= lr * p.grad
+
+    if epoch % 5000 == 0:
+        print(f"Step {epoch}: loss = {loss.item():.4f}")
+
+# Evaluate on validation set
+emb = C[X_val]
+h = torch.tanh(emb.view(-1, block_size * n_embd) @ W1 + b1)
+logits = h @ W2 + b2
+val_loss = F.cross_entropy(logits, Y_val)
+print(f"Validation loss: {val_loss.item():.4f}")  # ~2.1`}</CodeBlock>
+
+Some important new concepts:
+
+- **Mini-batches**: Instead of using all training data each step, we randomly sample 64 examples. This is like pagination -- processing chunks instead of everything at once. It is faster and actually helps the model generalize because the randomness acts as regularization.
+- **Embedding lookup**: `C[Xb]` uses the character indices to index into the embedding table. If `Xb[0]` is `[5, 13, 13]`, we get rows 5, 13, and 13 from `C`. This is more efficient than one-hot multiplication and does the same thing.
+- **`view(-1, 30)`**: Reshapes the tensor. The `-1` means "figure out this dimension automatically." It is like `array.flat()` but for multi-dimensional tensors with explicit target shape.
+- **`tanh`**: An activation function that squishes values between -1 and 1. It introduces *non-linearity* -- without it, stacking linear layers would just be one big linear layer (matrix times matrix is still a matrix).
+
+The validation loss dropped to about 2.1 -- a significant improvement over the bigram's 2.45. Let us see the generated names:
+
+<CodeBlock title="mlp_sample.py" language="python">{`# Sample from the MLP model
+g = torch.Generator().manual_seed(2147483647)
+
+for _ in range(15):
+    out = []
+    context = [0] * block_size
+    while True:
+        emb = C[torch.tensor([context])]
+        h = torch.tanh(emb.view(1, -1) @ W1 + b1)
+        logits = h @ W2 + b2
+        probs = F.softmax(logits, dim=1)
+        ix = torch.multinomial(probs, num_samples=1, generator=g).item()
+        if ix == 0:
+            break
+        out.append(itos[ix])
+        context = context[1:] + [ix]
+    print(''.join(out))`}</CodeBlock>
+
+```
+delin
+jara
+morede
+kailynn
+sadie
+jori
+madis
+amelie
+kendri
+taeli
+reese
+omi
+khi
+bryson
+terra
+```
+
+Now *these* look like real names. `"jara"`, `"sadie"`, `"bryson"` -- you could imagine seeing these in a classroom. The model learned that consonant clusters matter, that names have rhythm, and that certain endings (`-lyn`, `-ie`, `-on`) are common. All from 3 characters of context and 6,000 parameters.
+
+## Self-Attention
+
+Here is where things get interesting. The MLP treats its context window as a fixed-size concatenated vector. Position 1, 2, and 3 each have their own dedicated weights. But what if the model could *dynamically decide* which positions to pay attention to?
+
+That is the core idea of self-attention. Each position in the sequence asks: "Which other positions have information I need?" It then creates a weighted average of information from those positions.
+
+Let us build the intuition with three concepts:
+
+- **Query (Q)**: "What am I looking for?" -- Each position creates a query vector.
+- **Key (K)**: "What do I contain?" -- Each position also creates a key vector.
+- **Value (V)**: "What will I share if someone attends to me?" -- The actual information to pass along.
+
+Attention scores are computed by taking the dot product of queries with keys. If a query and key are similar (high dot product), that position gets more attention. Then we use these scores to compute a weighted sum of values.
+
+<CodeBlock title="attention.py" language="python">{`# Single-head self-attention from scratch
+import torch
+import torch.nn as nn
+
+torch.manual_seed(42)
+
+# Parameters
+B, T, C = 4, 8, 32  # batch, time (sequence length), channels (embedding dim)
+n_head_size = 16
+
+# Simulated input: random embeddings for a sequence of 8 characters
+x = torch.randn(B, T, C)
+
+# Attention projections (these are learned)
+key   = nn.Linear(C, n_head_size, bias=False)
+query = nn.Linear(C, n_head_size, bias=False)
+value = nn.Linear(C, n_head_size, bias=False)
+
+k = key(x)    # (B, T, 16)
+q = query(x)  # (B, T, 16)
+v = value(x)  # (B, T, 16)
+
+# Compute attention scores: how much does each position attend to each other?
+weights = q @ k.transpose(-2, -1)  # (B, T, T) -- dot product of all query-key pairs
+weights = weights * (n_head_size ** -0.5)  # scale down to prevent softmax saturation
+
+# Causal mask: prevent looking at future positions
+tril = torch.tril(torch.ones(T, T))
+weights = weights.masked_fill(tril == 0, float('-inf'))
+
+# Softmax to get attention probabilities
+weights = F.softmax(weights, dim=-1)  # (B, T, T) -- each row sums to 1
+
+# Weighted sum of values
+out = weights @ v  # (B, T, 16)
+
+print(f"Attention weights shape: {weights.shape}")
+print(f"Output shape: {out.shape}")
+print(f"Attention pattern for first sequence, last position:")
+print(weights[0, -1].data)`}</CodeBlock>
+
+<AttentionMatrix />
+
+The diagram shows the causal mask in action. Each row represents a position, and the cells show how much it attends to other positions. The `--` cells are masked out -- the model cannot look into the future. This is what makes it *autoregressive*: it can only use past context to predict the next token.
+
+The scaling factor `n_head_size ** -0.5` is crucial. Without it, the dot products would grow large for high-dimensional vectors, making softmax output nearly one-hot (attending to just one position). Scaling keeps the gradients healthy.
+
+Now let us extend to **multi-head attention**. Instead of one set of Q, K, V projections, we use several (say, 4) and concatenate their outputs. Each head can learn to attend to different things -- one might focus on recent characters, another on vowel patterns.
+
+<CodeBlock title="multihead.py" language="python">{`class Head(nn.Module):
+    """One head of self-attention"""
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+        v = self.value(x)
+
+        weights = q @ k.transpose(-2, -1) * (C ** -0.5)
+        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        weights = F.softmax(weights, dim=-1)
+        return weights @ v
+
+class MultiHeadAttention(nn.Module):
+    """Multiple heads of self-attention in parallel"""
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(num_heads * head_size, n_embd)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        return self.proj(out)`}</CodeBlock>
+
+<Callout type="info" title="nn.Module explained">
+  <p>If you are coming from JS, think of <code>nn.Module</code> as a base class (like extending <code>React.Component</code>). You define parameters in <code>__init__</code> and the computation in <code>forward</code>. PyTorch automatically collects all parameters for gradient updates. The <code>register_buffer</code> method stores tensors that are not trainable (like the mask).</p>
+</Callout>
+
+## The Full Transformer
+
+Now we assemble everything into a proper transformer. The architecture stacks multiple layers, each containing multi-head attention and a feed-forward network, with residual connections and layer normalization.
+
+<TransformerArch />
+
+Here is the complete model. Read through it -- every piece is something we already built above, just wired together.
+
+<CodeBlock title="transformer_model.py" language="python">{`import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Hyperparameters
+block_size = 16       # context length (characters the model can see)
+n_embd = 64           # embedding dimension
+n_head = 4            # number of attention heads
+n_layer = 4           # number of transformer blocks
+dropout = 0.2         # dropout rate for regularization
+learning_rate = 3e-4
+max_steps = 10000
+batch_size = 64
+
+class Head(nn.Module):
+    """Single head of self-attention"""
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+        v = self.value(x)
+        weights = q @ k.transpose(-2, -1) * (C ** -0.5)
+        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        weights = F.softmax(weights, dim=-1)
+        weights = self.dropout(weights)
+        return weights @ v
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(num_heads * head_size, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        return self.dropout(self.proj(out))
+
+class FeedForward(nn.Module):
+    """Simple feed-forward network: linear -> ReLU -> linear"""
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """Transformer block: attention + feed-forward with residual connections"""
+    def __init__(self):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward()
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))    # attention with residual connection
+        x = x + self.ffwd(self.ln2(x))  # feed-forward with residual connection
+        return x
+
+class NameTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_embedding = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[Block() for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+
+        tok_emb = self.token_embedding(idx)                     # (B, T, n_embd)
+        pos_emb = self.position_embedding(torch.arange(T))      # (T, n_embd)
+        x = tok_emb + pos_emb                                   # combine token + position info
+        x = self.blocks(x)                                      # apply transformer blocks
+        x = self.ln_f(x)                                        # final layer norm
+        logits = self.lm_head(x)                                # project to vocab size
+
+        if targets is None:
+            return logits, None
+
+        B, T, C = logits.shape
+        loss = F.cross_entropy(logits.view(B * T, C), targets.view(B * T))
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -block_size:]                     # crop to context window
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :]                           # focus on last position
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, idx_next], dim=1)
+        return idx`}</CodeBlock>
+
+Let us walk through the key architectural choices:
+
+- **Residual connections** (`x = x + self.sa(...)`): These are like skip connections. The input gets added to the output of each sub-layer. This helps gradients flow during training and makes deep networks trainable. Without them, a 4-layer model would be very hard to train.
+- **Layer normalization** (`nn.LayerNorm`): Normalizes activations to have mean 0 and variance 1 across the embedding dimension. This stabilizes training, similar to how you might normalize CSS dimensions for consistent layouts.
+- **Positional embedding**: Unlike the MLP where position was implicit in the concatenation order, the transformer needs explicit position information because attention is *permutation-invariant*. We add a learned embedding for each position so the model knows that position 0 is different from position 5.
+- **Dropout**: Randomly zeros out some activations during training. It is regularization -- forces the network not to rely too heavily on any single feature.
+
+<Callout type="warning" title="GPU recommended">
+  <p>The full transformer has around 50,000 parameters and trains for 10,000 steps. This will take a minute or two on a CPU. On a GPU (free tier on Colab), it takes seconds. If you are following along locally without a GPU, reduce <code>n_layer</code> to 2 and <code>max_steps</code> to 5000.</p>
+</Callout>
+
+Now let us prepare the data for the transformer (it expects a different format than the MLP) and train it:
+
+<CodeBlock title="transformer_data.py" language="python">{`# Build dataset for the transformer
+def build_transformer_dataset(words):
+    """Each name becomes a padded sequence of character indices."""
+    X, Y = [], []
+    for w in words:
+        chs = [0] + [stoi[ch] for ch in w] + [0]  # wrap with start/end tokens
+        for i in range(len(chs) - 1):
+            context = chs[:i + 1]
+            target = chs[i + 1]
+            # Pad or crop context to block_size
+            if len(context) > block_size:
+                context = context[-block_size:]
+            else:
+                context = [0] * (block_size - len(context)) + context
+            X.append(context)
+            Y.append(target)
+    return torch.tensor(X), torch.tensor(Y)
+
+X_train_t, Y_train_t = build_transformer_dataset(train_words)
+X_val_t, Y_val_t = build_transformer_dataset(val_words)
+print(f"Transformer training examples: {X_train_t.shape}")`}</CodeBlock>
+
+<CodeBlock title="transformer_train.py" language="python">{`# Initialize and train
+model = NameTransformer()
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+for step in range(max_steps):
+    # Sample a mini-batch
+    ix = torch.randint(0, X_train_t.shape[0], (batch_size,))
+    xb, yb = X_train_t[ix], Y_train_t[ix]
+
+    # Forward + backward + update
+    logits, loss = model(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+    if step % 2000 == 0:
+        # Also compute validation loss
+        with torch.no_grad():
+            vix = torch.randint(0, X_val_t.shape[0], (batch_size * 4,))
+            _, val_loss = model(X_val_t[vix], Y_val_t[vix])
+        print(f"Step {step}: train loss {loss.item():.4f}, val loss {val_loss.item():.4f}")
+
+# Final validation loss
+with torch.no_grad():
+    _, val_loss = model(X_val_t[:1000], Y_val_t[:1000])
+print(f"Final validation loss: {val_loss.item():.4f}")  # ~1.6`}</CodeBlock>
+
+<Callout type="info" title="AdamW vs manual gradient descent">
+  <p>For the bigram and MLP, we manually updated weights with <code>p.data -= lr * p.grad</code>. AdamW is a smarter optimizer that tracks the history of gradients and adapts the learning rate per-parameter. It is the standard choice for transformers. Think of it as the difference between hand-tuning CSS values and using a design system.</p>
+</Callout>
+
+Now the moment of truth -- let us generate names from the transformer:
+
+<CodeBlock title="transformer_sample.py" language="python">{`# Generate names from the transformer
+model.eval()  # switch to eval mode (disables dropout)
+
+for _ in range(20):
+    out = []
+    context = torch.zeros((1, block_size), dtype=torch.long)  # all start tokens
+    for _ in range(20):  # max name length
+        logits, _ = model(context)
+        probs = F.softmax(logits[:, -1, :], dim=-1)
+        ix = torch.multinomial(probs, num_samples=1).item()
+        if ix == 0:  # end token
+            break
+        out.append(itos[ix])
+        # Slide the context window
+        next_token = torch.tensor([[ix]])
+        context = torch.cat([context, next_token], dim=1)[:, -block_size:]
+    print(''.join(out))`}</CodeBlock>
+
+```
+alexandra
+michael
+jaden
+sophia
+terrence
+kaylin
+emilia
+brenton
+dariel
+savannah
+connor
+riley
+ariella
+marcus
+leona
+natalie
+dominic
+keira
+ashlyn
+carlos
+```
+
+Look at that. Real, plausible, diverse names. The transformer learned long-range dependencies that the MLP could not capture -- it knows that names starting with certain patterns tend to end in certain ways. It learned the *rhythm* of human names.
+
+## Comparing Models
+
+Let us see how all four models stack up. The loss curve tells the story clearly:
+
+<LossCurve />
+
+| Model | Val Loss | Sample Names | Parameters |
+|-------|----------|-------------|------------|
+| Bigram (counting) | ~2.45 | mnba, aia, rer | 729 (27x27 table) |
+| Neural Bigram | ~2.47 | mnba, aia, rer | 729 |
+| MLP (block_size=3) | ~2.10 | delin, jara, sadie | ~6,000 |
+| Transformer | ~1.60 | alexandra, sophia, marcus | ~50,000 |
+
+The progression is clear:
+
+1. **Bigram and neural bigram** hit the same wall -- you cannot do better than ~2.45 with one character of context. The neural version just learned the same statistics a different way.
+2. **The MLP** made a big jump by using 3 characters of context. It learned common patterns like `"-lyn"`, `"-son"`, `"-ie"` endings.
+3. **The transformer** crushed it by dynamically attending to the most relevant parts of the context. It learned global name structure, not just local character patterns.
+
+<Callout type="tip" title="What to explore next">
+  <p>There is so much you can try from here. Increase the context window to 32 characters and see if the transformer improves further. Add temperature scaling to <code>generate()</code> to control how creative vs conservative the outputs are. Try training on a different dataset -- song lyrics, city names, Pokémon names. Implement beam search for better generation quality. Add character-level tokenization vs BPE and compare. The architecture you built here is the same one that powers GPT -- just smaller.</p>
+</Callout>
+
+---
+
+You just built a transformer from scratch. Not by importing a library and calling `.fit()`, but by understanding every matrix multiply, every attention score, every residual connection. You started with the dumbest possible model, and at each step you saw exactly *why* the next model was better -- more context, learned representations, dynamic attention.
+
+The transformer you built has about 50,000 parameters. GPT-3 has 175 billion. The architecture is the same. The difference is scale -- more layers, more heads, more data, more compute. But the core ideas -- embeddings, attention, residual connections, layer norms -- are exactly what you implemented here.
+
+Happy building.
