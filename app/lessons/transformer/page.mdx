@@ -82,6 +82,8 @@ The simplest language model you can build: look at one character, predict the ne
 
 The idea is straightforward. We scan through every name and count how often each pair of characters appears together. If `'t'` is followed by `'h'` a thousand times, that pair gets a high count. Then we normalize the counts into probabilities.
 
+What we are really doing here is defining P(next character | previous character) -- a conditional probability distribution. A language model, at its core, is just a machine that assigns probabilities to sequences. Given some context, it tells you: how likely is each possible next token? The bigram model is the simplest version of this idea: the "context" is just one character.
+
 <CodeBlock title="bigram_counts.py" language="python">{`# Count character pairs (bigrams)
 N = torch.zeros((vocab_size, vocab_size), dtype=torch.int32)
 
@@ -96,6 +98,10 @@ for w in train_words:
 # Adding 1 for smoothing (avoids division by zero and log(0))
 P = (N + 1).float()
 P = P / P.sum(dim=1, keepdim=True)`}</CodeBlock>
+
+<Callout type="info" title="Why add 1? Laplace smoothing">
+  <p>Notice the <code>N + 1</code> before normalizing. This is called Laplace smoothing (or add-one smoothing). Without it, any character pair that never appeared in the training data gets a count of zero, which means a probability of zero. That might sound harmless, but it is catastrophic when we compute loss: <code>log(0) = negative infinity</code>. A single unseen bigram would make our entire evaluation blow up. By adding 1 to every count, we guarantee that every character pair has at least a tiny probability. It is a crude but effective way to say &quot;nothing is truly impossible, just unlikely.&quot;</p>
+</Callout>
 
 A few Python/PyTorch things to unpack here:
 
@@ -146,6 +152,10 @@ These are... not great names. Some look vaguely name-like (`"ard"`, `"an"`) but 
 
 Let us also compute the loss so we can compare models later. The standard metric is **negative log likelihood** (NLL). Lower is better.
 
+But why log likelihood? Think about what it means to evaluate a model on a whole word. The probability of `"emma"` is P(e|.) times P(m|e) times P(m|m) times P(a|m) times P(.|a). We are multiplying probabilities together. The problem is that multiplying many small numbers together quickly leads to numerical underflow -- the result becomes so tiny that floating-point numbers cannot represent it. Taking the logarithm fixes this: log(a times b) = log(a) + log(b). Products become sums, which computers handle gracefully.
+
+There is a deeper connection to information theory here. The negative log probability of an event, measured in nats (or bits if you use log base 2), is the "surprise" or "information content" of that event. A highly probable event (P close to 1) carries little surprise. A rare event (P close to 0) is very surprising. The average NLL across many examples is the cross-entropy between the true data distribution and the model -- and a perfect model would achieve NLL equal to the entropy of the true distribution (the irreducible uncertainty in the data). You literally cannot do better than that.
+
 <CodeBlock title="bigram_loss.py" language="python">{`# Compute negative log likelihood loss
 log_likelihood = 0.0
 n = 0
@@ -171,6 +181,10 @@ print(f"Bigram NLL: {nll.item():.4f}")  # ~2.45`}</CodeBlock>
 Now let us do the exact same thing -- predict the next character from one character -- but with a neural network instead of counting. Why? Because neural networks can be extended to handle more context, and they learn via gradients. This is the first step toward a transformer.
 
 Instead of a count matrix, we have a *weight* matrix `W` that the network will learn. We feed in a character as a one-hot vector, multiply by `W`, and get a score for every possible next character. Then we apply `softmax` to convert scores to probabilities.
+
+<Callout type="info" title="Why softmax specifically?">
+  <p>The weight matrix produces raw scores (called &quot;logits&quot;) that can be any real number -- negative, positive, huge, tiny. But we need a valid probability distribution: all values positive, summing to 1. Softmax does this in two steps. First, it exponentiates every logit: <code>exp(x)</code> maps any real number to a positive number. Second, it divides each by the sum of all exponentiated values, forcing everything to sum to 1. The exponential has a nice property: it preserves the ordering (bigger logits get bigger probabilities) while ensuring nothing is negative. A useful concept is &quot;temperature&quot;: if you divide logits by a temperature T before softmax, T &gt; 1 makes the distribution more uniform (more random generation) and T &lt; 1 makes it more peaked (more deterministic). At T approaching 0, it becomes argmax.</p>
+</Callout>
 
 <CodeBlock title="neural_bigram.py" language="python">{`# Neural bigram model
 g = torch.Generator().manual_seed(2147483647)
@@ -220,9 +234,9 @@ print(f"Final training loss: {loss.item():.4f}")  # ~2.47`}</CodeBlock>
 There is a lot happening here, so let us unpack the key ideas:
 
 - **Forward pass**: Convert the input character to a one-hot vector, multiply by the weight matrix `W` to get "logits" (raw scores), then apply softmax (exponentiate and normalize) to get probabilities. The `@` operator is matrix multiplication -- like `numpy.dot` or manual nested loops in JS.
-- **Loss**: We grab the probability the model assigned to the *correct* next character, take the log, negate it, and average. This is cross-entropy loss.
-- **Backward pass**: `loss.backward()` is where the magic happens. PyTorch traces every operation that produced `loss` and computes the gradient of `loss` with respect to `W`. This is called *autograd* -- automatic differentiation.
-- **Update**: We nudge `W` in the direction that reduces the loss. The learning rate (50 here, which is unusually large because our model is so simple) controls the step size.
+- **Loss**: We grab the probability the model assigned to the *correct* next character, take the log, negate it, and average. This is cross-entropy loss. Why is this the same as the NLL we computed for the bigram model? Cross-entropy between two distributions p (the true one) and q (our model) is defined as -sum(p * log(q)). When p is a one-hot vector (the true next character), the sum collapses to just -log(q_correct) -- the negative log probability of the correct class. So cross-entropy loss and NLL are the same thing when the target is a single correct answer.
+- **Backward pass**: `loss.backward()` is where the magic happens. PyTorch traces every operation that produced `loss` and computes the gradient of `loss` with respect to `W`. This is called *autograd* -- automatic differentiation. But why does this work? The gradient of the loss with respect to each weight tells you: "if I increase this weight by a tiny amount, how much does the loss change?" The gradient points in the direction of steepest increase. So we go the opposite direction to decrease the loss. This is the chain rule from calculus, applied automatically through every operation (matrix multiply, softmax, log) back to the original weights. That automatic application of the chain rule is called backpropagation, and `loss.backward()` does it all for you.
+- **Update**: We nudge `W` in the direction that reduces the loss. The learning rate (50 here, which is unusually large because our model is so simple) controls the step size. You can think of the loss as a hilly landscape where we are trying to find the lowest valley. The gradient tells us which direction is "downhill," and the learning rate determines how big of a step we take.
 
 After training, the weight matrix `W` essentially converges to the same thing as our count-based probability matrix `P`. The neural network rediscovered counting through gradient descent. Now let us sample from it:
 
@@ -263,6 +277,10 @@ That is expected -- same model, same result. But now we have the machinery to go
 Time for a real upgrade. Instead of looking at just one character, we will look at the last 3 characters (a "context window") and use a multi-layer perceptron (MLP) to predict the next one. This is the architecture from Bengio et al. (2003) -- a classic.
 
 The key new idea is **embeddings**. Instead of a one-hot vector (27 dimensions, mostly zeros), we represent each character as a small dense vector (say, 10 dimensions). The network learns these embeddings during training. Characters that behave similarly (like vowels) end up with similar embeddings.
+
+<Callout type="info" title="Why embeddings instead of one-hot vectors?">
+  <p>One-hot encoding has a fundamental problem: it treats every character as equally different from every other character. The distance between &apos;a&apos; and &apos;e&apos; is the same as between &apos;a&apos; and &apos;z&apos;. But we know that vowels behave similarly, and certain consonant clusters appear together. One-hot vectors live in a 27-dimensional space where all characters are orthogonal -- they share zero information. This is the curse of dimensionality: as the vocabulary grows, the space becomes increasingly sparse and the model cannot generalize. Embeddings solve this by projecting characters into a much smaller space (10 dimensions here) where the model can learn that similar characters are nearby. After training, you would find that vowels cluster together and consonants form their own groups. This compressed, learned representation is one of the most powerful ideas in deep learning.</p>
+</Callout>
 
 <MLPForwardPass />
 
@@ -359,10 +377,14 @@ print(f"Validation loss: {val_loss.item():.4f}")  # ~2.1`}</CodeBlock>
 
 Some important new concepts:
 
-- **Mini-batches**: Instead of using all training data each step, we randomly sample 64 examples. This is like pagination -- processing chunks instead of everything at once. It is faster and actually helps the model generalize because the randomness acts as regularization.
+- **Mini-batches**: Instead of using all training data each step, we randomly sample 64 examples. This is not just about speed, though it is faster. The noise introduced by random sampling is actually beneficial. Computing the gradient on the full dataset gives you the "true" gradient, but following it precisely tends to converge to sharp, narrow minima that do not generalize well. The noisy gradient from a mini-batch helps the optimizer escape these sharp minima and find flatter regions of the loss landscape -- and flatter minima correspond to solutions that generalize better to unseen data. This is stochastic gradient descent (SGD), and the stochasticity is a feature, not a bug.
 - **Embedding lookup**: `C[Xb]` uses the character indices to index into the embedding table. If `Xb[0]` is `[5, 13, 13]`, we get rows 5, 13, and 13 from `C`. This is more efficient than one-hot multiplication and does the same thing.
 - **`view(-1, 30)`**: Reshapes the tensor. The `-1` means "figure out this dimension automatically." It is like `array.flat()` but for multi-dimensional tensors with explicit target shape.
-- **`tanh`**: An activation function that squishes values between -1 and 1. It introduces *non-linearity* -- without it, stacking linear layers would just be one big linear layer (matrix times matrix is still a matrix).
+- **`tanh`**: An activation function that squishes values between -1 and 1. It introduces *non-linearity* -- without it, stacking linear layers would just be one big linear layer (matrix times matrix is still a matrix). This point deserves emphasis: if you stack two linear layers without a nonlinearity, the result is `(x @ W1) @ W2 = x @ (W1 @ W2)` -- just a single matrix multiply. No matter how many linear layers you stack, you get a linear function. The nonlinearity is what gives neural networks their power. The universal approximation theorem says that a network with even one hidden layer and a nonlinear activation can approximate *any* continuous function, given enough neurons. Tanh, ReLU, sigmoid -- the specific choice matters for training dynamics, but the key insight is that you need *something* nonlinear.
+
+<Callout type="info" title="Why learning rate decay?">
+  <p>Notice how the learning rate drops from 0.1 to 0.01 halfway through training. Early on, the model is far from any good solution, so you want large steps to cover ground quickly. But as training progresses and the model gets close to a minimum, large steps cause it to overshoot and oscillate around the optimum without ever settling in. Reducing the learning rate lets the model fine-tune its weights with smaller, more precise adjustments. Without decay, you often see the loss bounce around a good value without actually reaching it. More sophisticated optimizers like AdamW (which we will use later) handle some of this automatically, but explicit scheduling still helps.</p>
+</Callout>
 
 The validation loss dropped to about 2.1 -- a significant improvement over the bigram's 2.45. Let us see the generated names:
 
@@ -408,13 +430,19 @@ Now *these* look like real names. `"jara"`, `"sadie"`, `"bryson"` -- you could i
 
 Here is where things get interesting. The MLP treats its context window as a fixed-size concatenated vector. Position 1, 2, and 3 each have their own dedicated weights. But what if the model could *dynamically decide* which positions to pay attention to?
 
-That is the core idea of self-attention. Each position in the sequence asks: "Which other positions have information I need?" It then creates a weighted average of information from those positions.
+Consider the fundamental limitation of the MLP approach. With `block_size=3`, the model can only see 3 characters of context. A name like `"christopher"` has 11 characters -- the model predicting the final `"r"` has no idea it started with `"ch"`. You could increase the block size, but then the number of parameters grows linearly with context length, every position has its own dedicated weights, and the model cannot learn that a pattern at position 2 and the same pattern at position 7 are the same thing. The MLP is fundamentally position-rigid.
+
+That is the core idea of self-attention. Each position in the sequence asks: "Which other positions have information I need?" It then creates a weighted average of information from those positions. Any position can talk to any other position, and the communication pattern is learned from data, not hardwired.
 
 Let us build the intuition with three concepts:
 
 - **Query (Q)**: "What am I looking for?" -- Each position creates a query vector.
 - **Key (K)**: "What do I contain?" -- Each position also creates a key vector.
 - **Value (V)**: "What will I share if someone attends to me?" -- The actual information to pass along.
+
+<Callout type="info" title="Why separate Q, K, and V? Why not just use embeddings directly?">
+  <p>You might wonder: why not just take the dot product of the raw embeddings to compute attention? The separation into queries, keys, and values lets the model learn different roles for the same position. The query projection learns &quot;what am I looking for?&quot; while the key projection learns &quot;what do I advertise to others?&quot; and the value projection learns &quot;what information do I actually share?&quot; These can be very different. The letter &apos;a&apos; at position 5 might be looking for a preceding consonant (its query) while advertising that it is a vowel (its key) and sharing its specific identity (its value). Without this separation, you would be forced to use the same representation for all three roles, which severely limits what the model can learn.</p>
+</Callout>
 
 Attention scores are computed by taking the dot product of queries with keys. If a query and key are similar (high dot product), that position gets more attention. Then we use these scores to compute a weighted sum of values.
 
@@ -461,11 +489,19 @@ print(weights[0, -1].data)`}</CodeBlock>
 
 <AttentionMatrix />
 
-The diagram shows the causal mask in action. Each row represents a position, and the cells show how much it attends to other positions. The `--` cells are masked out -- the model cannot look into the future. This is what makes it *autoregressive*: it can only use past context to predict the next token.
+The diagram shows the causal mask in action. Each row represents a position, and the cells show how much it attends to other positions. The `--` cells are masked out -- the model cannot look into the future.
 
-The scaling factor `n_head_size ** -0.5` is crucial. Without it, the dot products would grow large for high-dimensional vectors, making softmax output nearly one-hot (attending to just one position). Scaling keeps the gradients healthy.
+<Callout type="info" title="Why causal masking?">
+  <p>The mask exists because of how we generate text. At generation time, when predicting character 6, we only have characters 1 through 5 -- character 7 does not exist yet. So during training, we must enforce the same constraint: each position can only attend to positions before it (and itself). If we let position 5 see position 6 during training, the model would learn to &quot;cheat&quot; by just copying the answer from the future. The causal mask (setting future positions to negative infinity before softmax) ensures the model learns to predict using only past context -- which is all it will have when generating new names.</p>
+</Callout>
+
+<Callout type="info" title="Why scale by sqrt(d_k)?">
+  <p>The scaling factor <code>n_head_size ** -0.5</code> (that is, dividing by the square root of the head dimension) comes directly from the &quot;Attention is All You Need&quot; paper. Here is why it matters: the dot product of two random vectors with dimension d has a variance that grows proportionally to d. So as the head size increases, the dot products get larger in magnitude. Large dot products push the softmax into saturated regions where the output is nearly one-hot (almost all the attention goes to one position). In those saturated regions, gradients are near zero, so the model stops learning. Dividing by sqrt(d) keeps the variance of the dot products roughly constant regardless of dimension, keeping softmax in a well-behaved range where gradients flow and the model can actually train.</p>
+</Callout>
 
 Now let us extend to **multi-head attention**. Instead of one set of Q, K, V projections, we use several (say, 4) and concatenate their outputs. Each head can learn to attend to different things -- one might focus on recent characters, another on vowel patterns.
+
+Why use multiple heads instead of one big attention? A single attention head computes one set of attention weights -- one pattern of "who attends to whom." But language has many simultaneous relationships. One head might learn "attend to the previous vowel," another might learn "attend to the first character of the name," and a third might learn "attend to the most recent consonant cluster." By running multiple heads in parallel and concatenating their outputs, the model can capture all these different types of relationships simultaneously. Each head operates in a smaller subspace (head_size = n_embd / n_heads), so the total computation is the same as one big head, but the expressiveness is much greater.
 
 <CodeBlock title="multihead.py" language="python">{`class Head(nn.Module):
     """One head of self-attention"""
@@ -623,10 +659,17 @@ class NameTransformer(nn.Module):
 
 Let us walk through the key architectural choices:
 
-- **Residual connections** (`x = x + self.sa(...)`): These are like skip connections. The input gets added to the output of each sub-layer. This helps gradients flow during training and makes deep networks trainable. Without them, a 4-layer model would be very hard to train.
-- **Layer normalization** (`nn.LayerNorm`): Normalizes activations to have mean 0 and variance 1 across the embedding dimension. This stabilizes training, similar to how you might normalize CSS dimensions for consistent layouts.
-- **Positional embedding**: Unlike the MLP where position was implicit in the concatenation order, the transformer needs explicit position information because attention is *permutation-invariant*. We add a learned embedding for each position so the model knows that position 0 is different from position 5.
-- **Dropout**: Randomly zeros out some activations during training. It is regularization -- forces the network not to rely too heavily on any single feature.
+**Residual connections** (`x = x + self.sa(...)`): These solve what is called the degradation problem. In theory, a deeper network should always be at least as good as a shallower one -- the extra layers could just learn the identity function and pass data through unchanged. But in practice, deeper networks are *harder* to train and often perform worse. The problem is that gradients must travel through every layer during backpropagation, and they tend to vanish or explode along the way. Residual connections fix this by making the identity the default behavior -- each layer only needs to learn the *residual*, the delta on top of the input. This was the key insight of ResNet (2015), and it is why we can train networks with dozens or hundreds of layers. There is also a gradient perspective: during backpropagation, the gradient has a "highway" through the addition operation, flowing directly from later layers to earlier ones without passing through any transformations that could distort it.
+
+<Callout type="info" title="Why layer normalization?">
+  <p>As data flows through many layers of transformations, the distribution of activations can drift -- values might grow very large or very small, making training unstable. Layer normalization re-centers (subtracts mean) and re-scales (divides by standard deviation) the activations at each layer, keeping them in a well-behaved range. Why LayerNorm instead of BatchNorm (which normalizes across the batch dimension)? BatchNorm computes statistics across the batch, which means its behavior changes depending on what other examples happen to be in the batch -- problematic for sequences of varying length. LayerNorm normalizes across the feature dimension within each individual example, so it is self-contained and consistent regardless of batch composition. This makes it the standard choice for transformers.</p>
+</Callout>
+
+**Positional embeddings**: This one is subtle but critical. Attention is *permutation-invariant* by default. If you shuffle the order of the input positions, the attention mechanism would produce the same output (just shuffled). That means without positional information, the model literally cannot distinguish `"cat"` from `"tac"` -- it sees the same set of characters and computes the same relationships. Position 1 and position 5 are identical to the attention mechanism. Positional embeddings break this symmetry by adding a unique learned vector to each position, so the model knows *where* each character sits in the sequence.
+
+**The feed-forward network after attention**: Attention is good at one thing -- mixing information across positions. But the mixing is essentially linear in the values (it is a weighted sum). The feed-forward network (FFN) adds per-position nonlinear processing power. Think of attention as "gather relevant information from context" and the FFN as "process that gathered information into something useful." The 4x expansion (`n_embd` to `4 * n_embd` back to `n_embd`) gives the FFN a wider intermediate layer with more capacity to learn complex transformations before projecting back down. This bottleneck-expand-compress pattern is a common design in deep learning.
+
+**Dropout**: Randomly zeroing out activations during training sounds destructive, but it is a powerful regularization technique. It forces the network to be robust -- no single neuron can become a critical point of failure because it might be dropped at any time. The network learns redundant representations. At test time, all neurons are active (and scaled accordingly), so you get the full model. Think of it like training a team where random members are absent each day -- the team learns to function without relying on any one person.
 
 <Callout type="warning" title="GPU recommended">
   <p>The full transformer has around 50,000 parameters and trains for 10,000 steps. This will take a minute or two on a CPU. On a GPU (free tier on Colab), it takes seconds. If you are following along locally without a GPU, reduce <code>n_layer</code> to 2 and <code>max_steps</code> to 5000.</p>

@@ -30,7 +30,15 @@ Think of it like this. Imagine you take a photo and add a tiny bit of static. Th
 
 Now imagine you train a neural network to look at a noisy image and predict what it looked like one step *less* noisy. If that network is good enough, you can start from pure static and iteratively clean it up until a brand-new image appears. That is the *reverse process* — and that is what a diffusion model learns.
 
+But *why* does this iterative process actually work? The deep reason connects to something called **score matching**. The "score" of a probability distribution is the gradient of its log-probability — it is a vector field that points toward regions of higher density. If you knew the score at every point in space and at every noise level, you could start from any random point and follow the arrows "uphill" until you land on a realistic data point. This is called **Langevin dynamics** — essentially gradient ascent on the log-probability landscape with a bit of noise to explore.
+
+The key insight of diffusion models: the noise predictor is learning an approximation of this score function. When the network predicts the noise in `x_t`, it is implicitly estimating which direction leads back toward the data. Each denoising step is one step of Langevin dynamics, following the learned score from noise toward structure.
+
 This idea was formalized in the 2020 paper **"Denoising Diffusion Probabilistic Models"** (DDPM) by Ho, Jain, and Abbasi-Srinivasan. It built on earlier work by Sohl-Dickstein et al. (2015) but made the training simple and the results stunning.
+
+<Callout type="info">
+**Why did diffusion models suddenly take over in 2020-2022?** The DDPM paper showed that a simple training objective — predict the noise — is mathematically equivalent to optimizing a variational lower bound on the data log-likelihood. This made training stable and reliable, unlike GANs where the generator and discriminator can spiral into instability. Then two follow-up ideas made them practical for images: **classifier-free guidance** (2022) let users steer generation with text prompts without needing a separate classifier, and **latent diffusion** (2022, the foundation of Stable Diffusion) moved the diffusion process into a compressed latent space so you did not need to run a thousand forward passes at full image resolution.
+</Callout>
 
 **How does it compare to other generative models?**
 
@@ -47,6 +55,8 @@ We are going to build one from scratch, and we are going to do it in 2D so you c
 Before we can denoise anything, we need data to noise up. We will generate a simple 2D spiral — a set of (x, y) points that curl outward from the origin.
 
 Why 2D? Because you can plot it. When your data lives in two dimensions, there is nowhere for bugs to hide. You can scatter-plot the real data, the noisy data, and the generated data and instantly see if things are working. This is the best way to build intuition before scaling up to images.
+
+More importantly, in 2D you can literally *see* the probability distribution — where the density is high, where the boundaries are, whether the model is capturing the right shape. In higher dimensions you are blind. You can only look at loss curves and generated samples and hope things are working. A model trained on images might produce something that "looks okay" while completely missing a mode of the distribution, and you would never know. In 2D, if the model is missing part of the spiral or putting too much density in the wrong place, you see it instantly in the scatter plot. That is why toy 2D problems are not just for beginners — researchers use them to debug new ideas before committing to expensive image experiments.
 
 Let us start with the imports. If you are coming from the Node ecosystem, think of `pip install` as `npm install` and `import torch` as `import React`.
 
@@ -107,6 +117,8 @@ We define a sequence of values called `beta_t` — one for each timestep. These 
 {"T = 1000  # total number of timesteps\nbeta = torch.linspace(0.0001, 0.02, T)  # noise schedule"}
 </CodeBlock>
 
+Why these specific numbers? The values 0.0001 to 0.02 were chosen empirically in the DDPM paper. If beta is too large too early, the data gets destroyed in the first few steps and the model never learns the fine-grained denoising that matters most for sample quality. If beta is too small throughout, training is inefficient and you need far more steps to reach pure noise. The linear schedule is a reasonable starting point, but it turns out to be suboptimal — it spends too many timesteps in the "almost pure noise" regime where `alpha_bar` is very close to zero, and the model is essentially just learning to predict noise from noise. The **cosine schedule** (from "Improved DDPM," Nichol and Dhariwal, 2021) was later found to work better because it keeps `alpha_bar` changing at a more uniform rate throughout the process, making better use of every timestep.
+
 From beta we derive two more sequences:
 
 - `alpha_t = 1 - beta_t` — the fraction of signal retained at each step.
@@ -129,6 +141,12 @@ q(x_t | x_0) = N(sqrt(alpha_bar_t) * x_0, (1 - alpha_bar_t) * I)
 ```
 
 In plain English: `x_t` is a Gaussian distribution centered at a scaled-down version of `x_0`, with variance that grows as `t` increases. When `alpha_bar_t` is close to 1 (early steps), the center is close to `x_0` and the variance is small — barely noisy. When `alpha_bar_t` is close to 0 (late steps), the center is near zero and the variance is near 1 — pure noise.
+
+This closed-form formula is not just a mathematical convenience — it is what makes training practical. Without it, to get `x_t` you would have to sequentially apply all `t` noise steps one by one: add noise at step 1, then step 2, then step 3, all the way up to step t. That is O(T) work per training sample. The closed form makes it O(1) — you can jump directly to any timestep in a single operation. This means the training loop can sample a random `t` and immediately compute `x_t` without iterating through the entire chain.
+
+<Callout type="info">
+**Why Gaussian noise specifically?** The forward process is a Markov chain where each step adds Gaussian noise. Gaussians are special for three reasons: (1) the sum of Gaussians is Gaussian, which is exactly why the closed-form formula above works — you can collapse T sequential noise additions into one, (2) the Central Limit Theorem tells us that any noise distribution converges to Gaussian after enough additive steps, so Gaussian is the natural endpoint regardless, and (3) Gaussians are fully characterized by just their mean and variance, which makes the posterior math tractable. If we used a different noise distribution (say, uniform), we would lose the clean closed-form and the reverse process derivation would be far more complex.
+</Callout>
 
 In code, the sampling trick turns this into:
 
@@ -185,7 +203,7 @@ We cannot just feed the raw timestep integer into the network — a single numbe
 
 This produces a 64-dimensional vector for each timestep. Different timesteps map to very different vectors, which helps the network distinguish "barely noisy" from "extremely noisy."
 
-If you have seen positional encodings in Transformers, this is the exact same idea — different frequencies encode different scales of position.
+But why go through this trouble? A single number — the raw timestep integer — does not give the network enough to work with. A linear layer receiving just one input can only learn a linear function of time, but the relationship between noise level and the correct denoising behavior is highly nonlinear. Sinusoidal embeddings project that single number into a high-dimensional space where different timesteps are clearly separated. The multiple frequencies (from very slow oscillations to very fast ones) capture both coarse and fine time resolution. Timestep 500 and 501 are close in the embedding space (they need similar denoising), while timestep 10 and 990 are far apart (very different noise levels). This is the same trick Transformers use for position encoding — sin and cos at different frequencies create unique "fingerprints" for each position, and the network can learn to extract whatever temporal information it needs by combining these frequencies through its weights.
 
 **The MLP architecture**
 
@@ -206,7 +224,11 @@ Let us unpack the PyTorch patterns here:
 - `torch.cat([a, b], dim=1)` concatenates tensors along dimension 1 (the feature dimension). It is like `a.map((row, i) => [...row, ...b[i]])`.
 
 <Callout type="tip">
-Why predict the noise instead of predicting the clean data directly? Both work in theory, but predicting noise leads to a simpler, more stable loss function. The network learns "what does randomness look like at this noise level?" rather than "what does the data look like?" — and that turns out to be an easier task.
+**Why predict the noise instead of predicting the clean data directly?** There are three solid reasons: (1) The noise `epsilon` is always roughly standard normal regardless of the timestep, so the prediction target has a consistent scale. If the network predicted `x_0` directly, the target would have very different magnitudes depending on `t` — at low noise levels it is close to the data, at high noise levels it is almost impossible to recover. (2) Empirically, noise prediction gives lower-variance gradients during training, which means more stable learning. (3) There is a deep theoretical connection — the predicted noise is proportional to the **score function** (the gradient of log-probability), which ties the whole framework back to score matching theory. That said, you *could* predict `x_0` directly (called "x0-prediction") or predict a blend of signal and noise called the "velocity" ("v-prediction"). These are different parameterizations of the same underlying math — they are all equivalent in what they can express, but noise prediction tends to work best in practice for standard DDPM.
+</Callout>
+
+<Callout type="info">
+**Why is an MLP enough here?** For 2D data, the probability distribution is simple enough that a few hidden layers can approximate the score function at every noise level. The network only needs to learn a mapping from a 66-dimensional input (2D point + 64D time embedding) to a 2D output. For images, this would not work at all — you would need a **U-Net**, an encoder-decoder architecture with skip connections that can process spatial structure at multiple resolutions using convolutions. The U-Net is to image diffusion what the MLP is to our 2D toy: the right inductive bias for the data's structure.
 </Callout>
 
 ---
@@ -222,6 +244,10 @@ Training a diffusion model is beautifully simple. The algorithm is just four ste
 
 The loss is plain MSE (Mean Squared Error) between the predicted noise and the actual noise. That is it. No adversarial games, no KL divergence, no ELBO tricks. Just "guess the noise."
 
+<Callout type="info">
+**Why is MSE the right loss?** This is not an arbitrary choice. The DDPM derivation starts from the variational lower bound (ELBO) on the data log-likelihood — the same objective VAEs use. When you work through the math, the ELBO decomposes into a sum of KL divergences, one per timestep, each of which measures how well the model reverses one step of the forward process. For Gaussian distributions, each KL divergence simplifies to an MSE between the predicted and true noise. The full ELBO has per-timestep weighting factors, but Ho et al. found that dropping the weights and using plain uniform MSE actually works *better* in practice — it slightly deviates from the true ELBO but produces higher-quality samples. So the "just predict the noise" simplicity is not dumbed down — it is the result of a principled derivation where the simplest version happened to win.
+</Callout>
+
 <CodeBlock title="train.py" language="python">
 {"# Hyperparameters\nbatch_size = 256\nlearning_rate = 3e-4\nn_epochs = 5000\n\n# Create model and optimizer\nmodel = NoisePredictor(time_embed_dim=64, hidden_dim=128)\noptimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)\n\n# Generate the dataset once\ndataset = make_spiral(n_points=2000)\n\nlosses = []\n\nfor epoch in range(n_epochs):\n    # 1. Sample a random batch of data points\n    idx = torch.randint(0, len(dataset), (batch_size,))\n    x_0 = dataset[idx]  # shape: (256, 2)\n    \n    # 2. Sample random timesteps for each point in the batch\n    t = torch.randint(0, T, (batch_size,))  # shape: (256,)\n    \n    # 3. Add noise to get x_t\n    x_t, noise = forward_diffusion(x_0, t, alpha_bar)\n    \n    # 4. Predict the noise and compute loss\n    noise_pred = model(x_t, t)\n    loss = nn.functional.mse_loss(noise_pred, noise)\n    \n    # Backprop and update\n    optimizer.zero_grad()  # clear old gradients\n    loss.backward()        # compute new gradients\n    optimizer.step()       # update weights\n    \n    losses.append(loss.item())\n    \n    if epoch % 500 == 0:\n        print(f'Epoch {epoch:4d} | Loss: {loss.item():.4f}')"}
 </CodeBlock>
@@ -229,11 +255,11 @@ The loss is plain MSE (Mean Squared Error) between the predicted noise and the a
 Let us walk through the training loop:
 
 - `torch.randint(0, len(dataset), (batch_size,))` picks 256 random indices — like `Array.from({length: 256}, () => Math.floor(Math.random() * 2000))`. We use these to grab a random batch from our dataset.
-- `torch.randint(0, T, (batch_size,))` picks a random timestep for each sample. This is key — each point in the batch gets noised to a different degree.
+- `torch.randint(0, T, (batch_size,))` picks a random timestep for each sample. This is key — each point in the batch gets noised to a different degree. This is essentially importance sampling over the diffusion process. If we always trained at the same timestep, the model would only learn to denoise at that one noise level and be useless at all others. Random `t` forces the model to handle every noise level from "barely touched" to "pure static." In practice, some timesteps are harder than others (intermediate noise levels tend to carry the most signal for learning), and advanced methods like P2 weighting adjust the loss to emphasize these harder timesteps.
 - `nn.functional.mse_loss(pred, target)` computes the mean squared error: `mean((pred - target)^2)`. This is our entire loss function.
 - `optimizer.zero_grad()` clears the gradients from the last step. PyTorch accumulates gradients by default (useful in some advanced scenarios), so you have to manually zero them.
 - `loss.backward()` runs backpropagation — computes how each weight contributed to the loss.
-- `optimizer.step()` updates the weights using Adam (an adaptive learning rate optimizer — think of it as SGD but smarter).
+- `optimizer.step()` updates the weights using Adam (an adaptive learning rate optimizer — think of it as SGD but smarter). Why Adam and not plain SGD? Diffusion models present a tricky optimization landscape — different parameters and different timesteps produce gradients with very different magnitudes. SGD with a single learning rate would either update too aggressively for some parameters or too slowly for others. Adam maintains per-parameter running averages of both the gradients and their squared values, then uses these to adapt the effective learning rate for each weight independently. It is almost universally used for diffusion model training.
 
 **Why does predicting noise work?**
 
@@ -287,6 +313,14 @@ mean = (1 / sqrt(alpha_t)) * (x_t - (beta_t / sqrt(1 - alpha_bar_t)) * eps_pred)
 This comes from Bayes' rule applied to the forward process. In plain English: take the current noisy point, subtract the predicted noise (scaled appropriately), and rescale. The network is telling us "I think this much of what you see is noise," and we remove it.
 
 The `if t_val > 0` check is important. During intermediate steps we add a small amount of fresh noise — this is the stochastic part that makes DDPM a probabilistic model. At the very last step we skip the noise so the output is clean.
+
+**Why add noise during sampling?** This is not just an implementation quirk. The reverse diffusion process is mathematically a **stochastic differential equation (SDE)** — the noise at each step is an integral part of the correct reverse dynamics. Adding noise keeps the samples exploring the right probability manifold and improves diversity — different noise draws lead to different but equally valid samples. If you remove the noise entirely (setting sigma to zero), you get a deterministic sampler that traces an **ordinary differential equation (ODE)**. This is exactly what **DDIM** (Denoising Diffusion Implicit Models, Song et al. 2020) does. DDIM is valid because the ODE defines the same marginal distributions, but it trades diversity for determinism — the same starting noise always produces the same output, and the samples can be slightly less diverse overall.
+
+<Callout type="info">
+**Why is sampling so slow, and what can you do about it?** Running 1000 forward passes through the network is expensive — for large image models, this can take minutes per sample. This is the main practical downside of diffusion models. Active research has produced several solutions: **DDIM** can skip steps (e.g., use only 50 out of 1000 steps) by solving the ODE with larger increments. **DPM-Solver** uses higher-order ODE solvers to get good samples in 10-20 steps. **Distillation** trains a separate student model to match the full sampling chain in fewer steps. **Consistency models** (Song et al., 2023) learn to map any noise level directly to the final output in a single step. This remains one of the most active areas of diffusion model research.
+</Callout>
+
+**Why does the reverse formula work?** The idea is to use Bayes' rule on the forward process. We know the forward transition `q(x_t | x_{t-1})` — it is just "add Gaussian noise." If we also knew `x_0`, we could compute the posterior `q(x_{t-1} | x_t, x_0)` in closed form using Bayes' rule — and it turns out to be Gaussian with a specific mean and variance. Of course we do not know `x_0` at sampling time, but we can *estimate* it: given the model's noise prediction `epsilon_pred`, we rearrange the forward equation `x_t = sqrt(alpha_bar_t) * x_0 + sqrt(1 - alpha_bar_t) * epsilon` to get `x_0_hat = (x_t - sqrt(1 - alpha_bar_t) * epsilon_pred) / sqrt(alpha_bar_t)`. We plug this estimate into the Bayesian posterior formula, and out comes the reverse step mean. That is exactly what the formula in the code computes.
 
 <Callout type="info">
 `@torch.no_grad()` is a decorator that tells PyTorch not to track operations for gradient computation. During sampling we are not training, so we do not need gradients. This saves memory and speeds things up significantly. It is like wrapping a section of code in a "read-only" mode.
