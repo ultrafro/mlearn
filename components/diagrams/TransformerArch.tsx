@@ -4,50 +4,87 @@ import { motion } from "framer-motion";
 
 export function TransformerArch() {
   // Layout constants
-  const W = 460;
+  const W = 620;
   const H = 760;
-  const cx = 200;          // central column for stem boxes
+  const cx = 175;          // central column for stem boxes
   const boxW = 170;
-  const boxH = 36;
-  const residualX = cx + boxW / 2 + 60; // x-coordinate for residual loop arc
+  const boxH = 38;
+  const residualX = cx + boxW / 2 + 90; // x-coordinate for residual loop arc
 
-  // Stem boxes (y = top of box). Top to bottom, but data flows bottom -> top.
-  // We build coordinates top-down because SVG y grows downward.
   type Box = {
     id: string;
     label: string;
     sub?: string;
     color: string;
-    text?: string; // text color override
+    /** Weight-parameter annotations rendered to the right of the box. */
+    weights?: string[];
   };
 
   const top: Box[] = [
     { id: "softmax", label: "Softmax", sub: "→ probabilities", color: "#f43f5e" },
-    { id: "linear", label: "Linear", sub: "n_embd → vocab_size", color: "#f43f5e" },
-    { id: "lnf",    label: "LayerNorm", sub: "ln_f", color: "#a1a1aa" },
+    {
+      id: "linear",
+      label: "Linear (lm_head)",
+      sub: "n_embd → vocab",
+      color: "#f43f5e",
+      weights: ["W: (n_embd, vocab)"],
+    },
+    {
+      id: "lnf",
+      label: "LayerNorm",
+      sub: "ln_f",
+      color: "#a1a1aa",
+      weights: ["γ, β: (n_embd,)"],
+    },
   ];
 
   const bottom: Box[] = [
-    { id: "embed",  label: "Token Emb  +  Position Emb", sub: "embedding(x) + embedding(pos)", color: "#06b6d4" },
+    {
+      id: "embed",
+      label: "Token Emb  +  Position Emb",
+      sub: "tok_emb(idx) + pos_emb(arange(T))",
+      color: "#06b6d4",
+      weights: [
+        "tok: (vocab, n_embd)",
+        "pos: (block_size, n_embd)",
+      ],
+    },
   ];
 
-  // Block-internal items (y top of box). Listed bottom-to-top so first item is read first.
   const blockItems: (Box & { kind: "node" | "add" })[] = [
-    // Bottom of block first
-    { id: "ln1",  kind: "node", label: "LayerNorm",          sub: "ln1",                   color: "#a1a1aa" },
-    { id: "mha",  kind: "node", label: "Multi-Head Attention", sub: "softmax(Q·Kᵀ / √d) · V  ×  n_head", color: "#7c3aed" },
-    { id: "add1", kind: "add",  label: "+",                  sub: "residual",              color: "#10b981" },
-    { id: "ln2",  kind: "node", label: "LayerNorm",          sub: "ln2",                   color: "#a1a1aa" },
-    { id: "ffn",  kind: "node", label: "Feed Forward",       sub: "Linear → ReLU → Linear", color: "#f59e0b" },
-    { id: "add2", kind: "add",  label: "+",                  sub: "residual",              color: "#10b981" },
+    { id: "ln1", kind: "node", label: "LayerNorm", sub: "ln1", color: "#a1a1aa", weights: ["γ, β: (n_embd,)"] },
+    {
+      id: "mha",
+      kind: "node",
+      label: "Multi-Head Attention",
+      sub: "softmax(Q·Kᵀ / √d) · V  ×  n_head",
+      color: "#7c3aed",
+      weights: [
+        "W_q, W_k, W_v: (n_embd, head)·n_head",
+        "W_o: (n_embd, n_embd)",
+      ],
+    },
+    { id: "add1", kind: "add", label: "+", color: "#10b981" },
+    { id: "ln2", kind: "node", label: "LayerNorm", sub: "ln2", color: "#a1a1aa", weights: ["γ, β: (n_embd,)"] },
+    {
+      id: "ffn",
+      kind: "node",
+      label: "Feed Forward",
+      sub: "Linear → ReLU → Linear",
+      color: "#f59e0b",
+      weights: [
+        "fc1: (n_embd, 4·n_embd)",
+        "fc2: (4·n_embd, n_embd)",
+      ],
+    },
+    { id: "add2", kind: "add", label: "+", color: "#10b981" },
   ];
 
-  // Y positions
   const padTop = 30;
   const labelGap = 24;
-  const blockGap = 20;
-  const innerGap = 18;     // between block items
-  const blockPad = 26;     // padding inside the dashed block container
+  const blockGap = 22;
+  const innerGap = 22;
+  const blockPad = 28;
 
   let y = padTop;
   const yProbLabel = y;
@@ -59,11 +96,9 @@ export function TransformerArch() {
     y += boxH + blockGap;
   }
 
-  // Block container starts here
   const blockTopY = y;
   y += blockPad;
 
-  // Block-internal positions, top-to-bottom in SVG (so add2 is at the top of the block)
   const blockYs: number[] = [];
   const reversedBlockItems = [...blockItems].reverse();
   const addH = 28;
@@ -71,12 +106,11 @@ export function TransformerArch() {
     blockYs.push(y);
     y += (item.kind === "add" ? addH : boxH) + innerGap;
   }
-  y -= innerGap; // remove last gap
+  y -= innerGap;
   y += blockPad;
   const blockBottomY = y;
   y += blockGap;
 
-  // Bottom items
   const bottomYs: number[] = [];
   for (const _ of bottom) {
     bottomYs.push(y);
@@ -84,7 +118,6 @@ export function TransformerArch() {
   }
   const yInputLabel = y - blockGap + 6;
 
-  // Map item id -> (yTop, height)
   const itemAt = new Map<string, { y: number; h: number; centerY: number }>();
   top.forEach((b, i) => itemAt.set(b.id, { y: topYs[i], h: boxH, centerY: topYs[i] + boxH / 2 }));
   reversedBlockItems.forEach((b, i) => {
@@ -93,18 +126,14 @@ export function TransformerArch() {
   });
   bottom.forEach((b, i) => itemAt.set(b.id, { y: bottomYs[i], h: boxH, centerY: bottomYs[i] + boxH / 2 }));
 
-  // Stem flow connections (consecutive boxes from bottom to top)
-  // Order: embed -> ln1 -> mha -> add1 -> ln2 -> ffn -> add2 -> lnf -> linear -> softmax
   const flowOrder = ["embed", "ln1", "mha", "add1", "ln2", "ffn", "add2", "lnf", "linear", "softmax"];
 
-  // Shape labels alongside the stem
   const shapeLabels: { id: string; text: string; where: "below" | "above" }[] = [
-    { id: "embed",   text: "(B, T, n_embd)", where: "above" },
-    { id: "lnf",     text: "(B, T, n_embd)", where: "above" },
-    { id: "linear",  text: "(B, T, vocab)",  where: "above" },
+    { id: "embed", text: "(B, T, n_embd)", where: "above" },
+    { id: "lnf", text: "(B, T, n_embd)", where: "above" },
+    { id: "linear", text: "(B, T, vocab)", where: "above" },
   ];
 
-  // Helper for residual arc path: from input-of-block point, around the right, into the add node
   const arcPath = (fromY: number, toY: number) => {
     const startX = cx + boxW / 2;
     const endX = cx + boxW / 2;
@@ -113,14 +142,13 @@ export function TransformerArch() {
             C ${peakX} ${fromY}, ${peakX} ${toY}, ${endX + 6} ${toY}`;
   };
 
-  // Where do residuals branch from?
-  // Residual 1: branches from above embed (block input) ─ joins add1
-  // Residual 2: branches from above add1 ─ joins add2
-  const blockInputY = (itemAt.get("embed")!.y) - blockGap / 2; // just above embed top? we want just at block bottom
-  const blockInputBranch = blockBottomY - 4; // a hair inside the block bottom
+  const blockInputBranch = blockBottomY - 4;
   const add1Mid = itemAt.get("add1")!.centerY;
   const add2Mid = itemAt.get("add2")!.centerY;
   const branchAfterAdd1 = (itemAt.get("add1")!.y) - innerGap / 2 - 2;
+
+  // x-coordinate where weight annotations begin (just past the residual arc)
+  const weightX = residualX + 18;
 
   return (
     <div className="not-prose my-8">
@@ -129,30 +157,14 @@ export function TransformerArch() {
           Transformer Block Architecture
         </h3>
         <p className="text-xs text-zinc-500 dark:text-zinc-400 mb-4">
-          Pre-norm GPT-style block. Data flows bottom → top. Dashed lines are residual (skip) connections.
+          Pre-norm GPT-style block. Data flows bottom → top. Left labels show the activation tensor shape; right labels show each layer&apos;s learnable weights. Dashed lines are residual (skip) connections.
         </p>
-        <svg viewBox={`0 0 ${W} ${H}`} className="w-full max-w-[460px] mx-auto">
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full max-w-[620px] mx-auto">
           <defs>
-            <marker
-              id="arrowhead"
-              viewBox="0 0 10 10"
-              refX="9"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
+            <marker id="arrowhead" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
               <path d="M 0 0 L 10 5 L 0 10 z" className="fill-zinc-500 dark:fill-zinc-400" />
             </marker>
-            <marker
-              id="arrowhead-residual"
-              viewBox="0 0 10 10"
-              refX="9"
-              refY="5"
-              markerWidth="6"
-              markerHeight="6"
-              orient="auto-start-reverse"
-            >
+            <marker id="arrowhead-residual" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
               <path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981" />
             </marker>
           </defs>
@@ -174,7 +186,7 @@ export function TransformerArch() {
             transition={{ duration: 0.5, delay: 0.6 }}
           />
 
-          {/* Sub-layer grouping: thin left-edge accent bar marking what each residual bypasses */}
+          {/* Sub-layer accent bars */}
           {(() => {
             const ln1 = itemAt.get("ln1")!;
             const mha = itemAt.get("mha")!;
@@ -200,14 +212,15 @@ export function TransformerArch() {
               />
             ));
           })()}
-          {/* xN badge — to the far right, beyond the residual arc */}
+
+          {/* xN badge — far right */}
           <motion.g
             initial={{ opacity: 0, scale: 0.9 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.4, delay: 0.8 }}
           >
             <rect
-              x={W - 78}
+              x={W - 64}
               y={(blockTopY + blockBottomY) / 2 - 18}
               width={56}
               height={36}
@@ -218,44 +231,26 @@ export function TransformerArch() {
               strokeOpacity={0.55}
               strokeWidth={1}
             />
-            <text
-              x={W - 50}
-              y={(blockTopY + blockBottomY) / 2 - 1}
-              textAnchor="middle"
-              className="fill-violet-600 dark:fill-violet-400"
-              fontSize="13"
-              fontWeight={700}
-            >
+            <text x={W - 36} y={(blockTopY + blockBottomY) / 2 - 1} textAnchor="middle" className="fill-violet-600 dark:fill-violet-400" fontSize="13" fontWeight={700}>
               × N
             </text>
-            <text
-              x={W - 50}
-              y={(blockTopY + blockBottomY) / 2 + 12}
-              textAnchor="middle"
-              className="fill-zinc-400"
-              fontSize="9"
-              fontFamily="monospace"
-            >
+            <text x={W - 36} y={(blockTopY + blockBottomY) / 2 + 12} textAnchor="middle" className="fill-zinc-400" fontSize="9" fontFamily="monospace">
               n_layer
             </text>
           </motion.g>
 
-          {/* Flow lines: from each item to the next, with arrowheads */}
+          {/* Flow lines with arrowheads */}
           {flowOrder.slice(0, -1).map((fromId, idx) => {
             const toId = flowOrder[idx + 1];
             const from = itemAt.get(fromId)!;
             const to = itemAt.get(toId)!;
-            const x1 = cx;
-            const y1 = from.y; // top of source box
-            const x2 = cx;
-            const y2 = to.y + to.h; // bottom of dest box
             return (
               <motion.line
                 key={`flow-${idx}`}
-                x1={x1}
-                y1={y1}
-                x2={x2}
-                y2={y2}
+                x1={cx}
+                y1={from.y}
+                x2={cx}
+                y2={to.y + to.h}
                 className="stroke-zinc-400 dark:stroke-zinc-500"
                 strokeWidth={1.6}
                 markerStart="url(#arrowhead)"
@@ -266,7 +261,7 @@ export function TransformerArch() {
             );
           })}
 
-          {/* Residual 1: from block input -> add1 */}
+          {/* Residual arcs */}
           <motion.path
             d={arcPath(blockInputBranch, add1Mid)}
             fill="none"
@@ -278,7 +273,6 @@ export function TransformerArch() {
             animate={{ pathLength: 1, opacity: 0.9 }}
             transition={{ duration: 0.7, delay: 1.0 }}
           />
-          {/* Residual 2: from after add1 -> add2 */}
           <motion.path
             d={arcPath(branchAfterAdd1, add2Mid)}
             fill="none"
@@ -290,11 +284,10 @@ export function TransformerArch() {
             animate={{ pathLength: 1, opacity: 0.9 }}
             transition={{ duration: 0.7, delay: 1.3 }}
           />
-          {/* Branch dots */}
           <circle cx={cx + boxW / 2} cy={blockInputBranch} r={3.5} fill="#10b981" />
           <circle cx={cx + boxW / 2} cy={branchAfterAdd1} r={3.5} fill="#10b981" />
 
-          {/* Render boxes */}
+          {/* Boxes + add nodes */}
           {[...top, ...reversedBlockItems, ...bottom].map((item, idx) => {
             const pos = itemAt.get(item.id)!;
             const isAdd = "kind" in item && (item as any).kind === "add";
@@ -311,45 +304,12 @@ export function TransformerArch() {
                   animate={{ opacity: 1, scale: 1 }}
                   transition={{ duration: 0.3, delay: 0.05 * idx }}
                 >
-                  <circle
-                    cx={cx}
-                    cy={pos.centerY}
-                    r={r}
-                    fill="white"
-                    stroke="#10b981"
-                    strokeWidth={2.2}
-                    className="dark:fill-zinc-900"
-                  />
-                  <text
-                    x={cx}
-                    y={pos.centerY + 5}
-                    textAnchor="middle"
-                    fill="#10b981"
-                    fontSize="16"
-                    fontWeight={700}
-                  >
-                    +
-                  </text>
-                  {/* Formula label to the left of + */}
-                  <text
-                    x={cx - r - 6}
-                    y={pos.centerY - 1}
-                    textAnchor="end"
-                    className="fill-emerald-600 dark:fill-emerald-400"
-                    fontSize="10"
-                    fontFamily="monospace"
-                    fontWeight={600}
-                  >
+                  <circle cx={cx} cy={pos.centerY} r={r} fill="white" stroke="#10b981" strokeWidth={2.2} className="dark:fill-zinc-900" />
+                  <text x={cx} y={pos.centerY + 5} textAnchor="middle" fill="#10b981" fontSize="16" fontWeight={700}>+</text>
+                  <text x={cx - r - 6} y={pos.centerY - 1} textAnchor="end" className="fill-emerald-600 dark:fill-emerald-400" fontSize="10" fontFamily="monospace" fontWeight={600}>
                     {formula[0]}
                   </text>
-                  <text
-                    x={cx + r + 6}
-                    y={pos.centerY - 1}
-                    className="fill-emerald-600 dark:fill-emerald-400"
-                    fontSize="10"
-                    fontFamily="monospace"
-                    fontWeight={600}
-                  >
+                  <text x={cx + r + 6} y={pos.centerY - 1} className="fill-emerald-600 dark:fill-emerald-400" fontSize="10" fontFamily="monospace" fontWeight={600}>
                     {formula[1]}
                   </text>
                 </motion.g>
@@ -397,7 +357,7 @@ export function TransformerArch() {
             );
           })}
 
-          {/* Shape labels */}
+          {/* Activation shape labels (left side) */}
           {shapeLabels.map(({ id, text, where }) => {
             const pos = itemAt.get(id)!;
             const yPos = where === "above" ? pos.y - 6 : pos.y + pos.h + 12;
@@ -416,52 +376,75 @@ export function TransformerArch() {
             );
           })}
 
-          {/* Top label: Probabilities */}
-          <text
-            x={cx}
-            y={yProbLabel + 10}
-            textAnchor="middle"
-            className="fill-zinc-500 dark:fill-zinc-400"
-            fontSize="10"
-            fontWeight={600}
-          >
+          {/* Weight annotations (right side) */}
+          {[...top, ...reversedBlockItems, ...bottom].map((item) => {
+            if (!("weights" in item) || !item.weights || item.weights.length === 0) return null;
+            const pos = itemAt.get(item.id)!;
+            const lines = item.weights;
+            const startY = pos.centerY - ((lines.length - 1) * 11) / 2 + 3;
+            return (
+              <motion.g
+                key={`w-${item.id}`}
+                initial={{ opacity: 0, x: -4 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ duration: 0.4, delay: 1.4 }}
+              >
+                {lines.map((line, li) => (
+                  <text
+                    key={li}
+                    x={weightX}
+                    y={startY + li * 11}
+                    className="fill-zinc-500 dark:fill-zinc-400"
+                    fontSize="9"
+                    fontFamily="monospace"
+                  >
+                    {line}
+                  </text>
+                ))}
+              </motion.g>
+            );
+          })}
+
+          {/* Top label */}
+          <text x={cx} y={yProbLabel + 10} textAnchor="middle" className="fill-zinc-500 dark:fill-zinc-400" fontSize="10" fontWeight={600}>
             Next-Character Probabilities
           </text>
 
-          {/* Bottom label: Input */}
-          <text
-            x={cx}
-            y={yInputLabel + 14}
-            textAnchor="middle"
-            className="fill-zinc-500 dark:fill-zinc-400"
-            fontSize="10"
-            fontWeight={600}
-          >
+          {/* Bottom label */}
+          <text x={cx} y={yInputLabel + 14} textAnchor="middle" className="fill-zinc-500 dark:fill-zinc-400" fontSize="10" fontWeight={600}>
             Input Characters &nbsp;
             <tspan className="fill-zinc-400" fontFamily="monospace" fontSize="9">(B, T)</tspan>
           </text>
 
-          {/* Legend (right side) */}
-          <g transform={`translate(${W - 130}, ${blockTopY - 6})`}>
-            <text x={0} y={0} className="fill-zinc-500" fontSize="9" fontWeight={700}>LEGEND</text>
-            <g transform="translate(0, 12)">
-              <rect width={10} height={10} rx={2} fill="#7c3aed" />
-              <text x={14} y={9} fontSize="9" className="fill-zinc-500">attention</text>
-            </g>
-            <g transform="translate(0, 26)">
-              <rect width={10} height={10} rx={2} fill="#f59e0b" />
-              <text x={14} y={9} fontSize="9" className="fill-zinc-500">feed-forward</text>
-            </g>
-            <g transform="translate(0, 40)">
-              <rect width={10} height={10} rx={2} fill="#a1a1aa" />
-              <text x={14} y={9} fontSize="9" className="fill-zinc-500">normalization</text>
-            </g>
-            <g transform="translate(0, 54)">
-              <line x1={0} y1={5} x2={10} y2={5} stroke="#10b981" strokeWidth={1.6} strokeDasharray="3 2" />
-              <text x={14} y={9} fontSize="9" className="fill-zinc-500">residual</text>
-            </g>
-          </g>
+          {/* Column headers */}
+          <text x={weightX} y={padTop + 12} className="fill-zinc-400" fontSize="9" fontWeight={700} letterSpacing="0.05em">
+            LEARNED WEIGHTS →
+          </text>
+          <text x={cx - boxW / 2 - 18} y={padTop + 12} textAnchor="end" className="fill-zinc-400" fontSize="9" fontWeight={700} letterSpacing="0.05em">
+            ← ACTIVATIONS
+          </text>
         </svg>
+        <div className="flex flex-wrap items-center justify-center gap-4 mt-4 text-[11px]">
+          <span className="text-zinc-500 dark:text-zinc-400 font-semibold mr-2">LEGEND:</span>
+          {[
+            { color: "#7c3aed", label: "attention" },
+            { color: "#f59e0b", label: "feed-forward" },
+            { color: "#a1a1aa", label: "normalization" },
+            { color: "#06b6d4", label: "embedding" },
+            { color: "#f43f5e", label: "output head" },
+          ].map(({ color, label }) => (
+            <span key={label} className="flex items-center gap-1.5">
+              <span className="inline-block w-3 h-3 rounded-sm" style={{ backgroundColor: color }} />
+              <span className="text-zinc-500 dark:text-zinc-400">{label}</span>
+            </span>
+          ))}
+          <span className="flex items-center gap-1.5">
+            <svg width={20} height={6}>
+              <line x1={0} y1={3} x2={20} y2={3} stroke="#10b981" strokeWidth={1.6} strokeDasharray="3 2" />
+            </svg>
+            <span className="text-zinc-500 dark:text-zinc-400">residual</span>
+          </span>
+        </div>
         <p className="text-xs text-zinc-500 dark:text-zinc-400 text-center mt-3">
           The block (dashed box) repeats <span className="font-mono">n_layer</span> times. Each sublayer is wrapped in a residual: <span className="font-mono">x = x + sublayer(LN(x))</span>.
         </p>

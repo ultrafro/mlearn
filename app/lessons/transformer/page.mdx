@@ -605,27 +605,32 @@ class MultiHeadAttention(nn.Module):
 
 ## The Full Transformer
 
-Now we assemble everything into a proper transformer. The architecture stacks multiple layers, each containing multi-head attention and a feed-forward network, with residual connections and layer normalization.
+Now we assemble everything we have built into a proper transformer. The diagram below shows the architecture: token + position embeddings on the input, a stack of identical Blocks in the middle (each one is multi-head attention + feed-forward, both wrapped in residual connections), and a Linear + Softmax on top that projects to next-character probabilities. Both the activation shapes (left) and the learnable weight shapes (right) are annotated so you can keep track of the abstraction at each step.
 
 <TransformerArch />
 
-Here is the complete model. Read through it -- every piece is something we already built above, just wired together.
+Rather than dump the entire model file at once, we will build it bottom-up -- each class composes the ones we have already shown, and we explain its role *before* you read the code.
 
-<CodeBlock title="transformer_model.py" language="python">{`import torch
-import torch.nn as nn
-import torch.nn.functional as F
+### Hyperparameters
 
-# Hyperparameters
-block_size = 16       # context length (characters the model can see)
-n_embd = 64           # embedding dimension
-n_head = 4            # number of attention heads
-n_layer = 4           # number of transformer blocks
-dropout = 0.2         # dropout rate for regularization
+A few numbers drive the size and shape of every tensor in the model:
+
+<CodeBlock title="hparams.py" language="python">{`block_size = 16   # context length: characters the model can see at once
+n_embd = 64       # embedding dimension: each char becomes a 64-dim vector
+n_head = 4        # number of attention heads (n_embd must be divisible by n_head)
+n_layer = 4       # number of transformer blocks stacked
+
+dropout = 0.2     # zero-out probability during training
 learning_rate = 3e-4
 max_steps = 10000
 batch_size = 64
+`}</CodeBlock>
 
-class Head(nn.Module):
+### Single-head attention (with dropout)
+
+This is the same `Head` class we built in the self-attention section, with one new piece: a `nn.Dropout` layer applied to the attention weights. Dropout randomly zeros some entries during training so the model cannot lean on any single connection (more on dropout below). The shapes are unchanged: input `(B, T, n_embd)` → output `(B, T, head_size)`.
+
+<CodeBlock title="head.py" language="python">{`class Head(nn.Module):
     """Single head of self-attention"""
     def __init__(self, head_size):
         super().__init__()
@@ -645,8 +650,13 @@ class Head(nn.Module):
         weights = F.softmax(weights, dim=-1)
         weights = self.dropout(weights)
         return weights @ v
+`}</CodeBlock>
 
-class MultiHeadAttention(nn.Module):
+### Multi-head attention
+
+Run `n_head` heads in parallel, concatenate their outputs along the feature axis, and project back to `n_embd` with a learned linear layer. Each head sees `(B, T, n_embd)` going in and produces `(B, T, head_size)` where `head_size = n_embd / n_head`. After concatenation across heads, the shape is back to `(B, T, n_embd)` -- so the block can be stacked freely.
+
+<CodeBlock title="multihead.py" language="python">{`class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
@@ -656,8 +666,13 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         return self.dropout(self.proj(out))
+`}</CodeBlock>
 
-class FeedForward(nn.Module):
+### Feed-forward network
+
+Attention is good at one thing -- mixing information across positions. But the mixing is essentially linear in the values (it is a weighted sum). The feed-forward network adds per-position nonlinear processing power. Think of attention as "gather relevant information from context" and the FFN as "process that gathered information into something useful." The 4× expansion (`n_embd → 4·n_embd → n_embd`) gives the FFN a wider intermediate layer with more capacity to learn complex transformations before projecting back down. This bottleneck-expand-compress pattern is a common design in deep learning.
+
+<CodeBlock title="ffn.py" language="python">{`class FeedForward(nn.Module):
     """Simple feed-forward network: linear -> ReLU -> linear"""
     def __init__(self):
         super().__init__()
@@ -670,9 +685,25 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+`}</CodeBlock>
 
-class Block(nn.Module):
-    """Transformer block: attention + feed-forward with residual connections"""
+### Transformer block
+
+The Block wires one attention sub-layer and one FFN sub-layer with residual (skip) connections. We use the **pre-norm** variant (the GPT-style one used in the diagram above): LayerNorm comes *before* each sub-layer, and the residual carries the unmodified input around. The two lines of `forward` are exactly what each green `+` node in the diagram represents:
+
+```python
+x = x + self.sa(self.ln1(x))    # attention sub-layer with residual
+x = x + self.ffwd(self.ln2(x))  # FFN sub-layer with residual
+```
+
+**Why residual connections?** They solve the *degradation problem*. In theory, a deeper network should always be at least as good as a shallower one -- the extra layers could just learn the identity function and pass data through unchanged. But in practice, deeper networks are *harder* to train and often perform worse, because gradients vanish or explode while traveling through every layer during backpropagation. Residual connections fix this by making the identity the default: each layer only needs to learn the *delta* on top of the input. There is also a gradient perspective -- the addition operator gives the gradient a "highway" that flows directly from later layers to earlier ones without passing through any transformation that could distort it. This was the key insight of ResNet (2015), and it is why we can train networks with dozens or hundreds of layers.
+
+<Callout type="info" title="Why layer normalization?">
+  <p>As data flows through many layers of transformations, the distribution of activations can drift -- values might grow very large or very small, making training unstable. Layer normalization re-centers (subtracts mean) and re-scales (divides by standard deviation) the activations at each layer, keeping them in a well-behaved range. Why LayerNorm instead of BatchNorm (which normalizes across the batch dimension)? BatchNorm computes statistics across the batch, which means its behavior changes depending on what other examples happen to be in the batch -- problematic for sequences of varying length. LayerNorm normalizes across the feature dimension within each individual example, so it is self-contained and consistent regardless of batch composition. This makes it the standard choice for transformers.</p>
+</Callout>
+
+<CodeBlock title="block.py" language="python">{`class Block(nn.Module):
+    """Transformer block: attention + FFN with pre-norm residuals"""
     def __init__(self):
         super().__init__()
         head_size = n_embd // n_head
@@ -682,11 +713,29 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = x + self.sa(self.ln1(x))    # attention with residual connection
-        x = x + self.ffwd(self.ln2(x))  # feed-forward with residual connection
+        x = x + self.sa(self.ln1(x))    # attention sub-layer with residual
+        x = x + self.ffwd(self.ln2(x))  # FFN sub-layer with residual
         return x
+`}</CodeBlock>
 
-class NameTransformer(nn.Module):
+### Putting it all together: NameTransformer
+
+The outer model wires up the input embeddings, the stack of `n_layer` Blocks, a final LayerNorm, and the output projection (`lm_head`). The forward pass is:
+
+1. **Token embedding**: look up an `n_embd`-dim vector for each character → `(B, T, n_embd)`
+2. **Position embedding**: look up an `n_embd`-dim vector for each position 0..T-1 → `(T, n_embd)`, broadcast across batch
+3. **Add them**: `x = tok_emb + pos_emb` → `(B, T, n_embd)`
+4. **Stacked blocks**: pass through `n_layer` Blocks (shape preserved at every step)
+5. **Final LayerNorm**, then `lm_head` projects to `(B, T, vocab_size)` logits
+
+**About positional embeddings.** Attention is *permutation-invariant* by default. Shuffle the order of the input positions and the attention mechanism produces the same output (just shuffled). Without positional information, the model literally cannot distinguish `"cat"` from `"tac"` -- it sees the same set of characters and computes the same relationships. Positional embeddings break this symmetry by giving each position its own vector that is added to the token embedding before anything else happens.
+
+<Callout type="info" title="Yes — the positional embeddings are learned">
+  <p>In our model, <code>self.position_embedding = nn.Embedding(block_size, n_embd)</code> creates a table of <code>block_size</code> learnable vectors -- one per slot in the context window. They start out random and are updated by gradient descent during training, just like any other parameter. The model figures out for itself what each position should &quot;mean&quot;: it might learn that position 0 is special (start-of-name), that adjacent positions are related, and so on.</p>
+  <p>This is the GPT-style approach (&quot;learned positional embeddings&quot;). The original 2017 Transformer paper used <em>fixed sinusoidal</em> embeddings instead -- a hand-designed set of sine and cosine waves at different frequencies, with no learnable parameters. Both approaches work; learned embeddings are simpler and let the model adapt the representation to the data, but they only work for positions ≤ <code>block_size</code> (the model has never seen embeddings beyond that). Sinusoidal embeddings extrapolate to longer sequences for free, at the cost of being less flexible.</p>
+</Callout>
+
+<CodeBlock title="name_transformer.py" language="python">{`class NameTransformer(nn.Module):
     def __init__(self):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, n_embd)
@@ -720,31 +769,61 @@ class NameTransformer(nn.Module):
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, idx_next], dim=1)
-        return idx`}</CodeBlock>
+        return idx
+`}</CodeBlock>
 
-Let us walk through the key architectural choices:
-
-**Residual connections** (`x = x + self.sa(...)`): These solve what is called the degradation problem. In theory, a deeper network should always be at least as good as a shallower one -- the extra layers could just learn the identity function and pass data through unchanged. But in practice, deeper networks are *harder* to train and often perform worse. The problem is that gradients must travel through every layer during backpropagation, and they tend to vanish or explode along the way. Residual connections fix this by making the identity the default behavior -- each layer only needs to learn the *residual*, the delta on top of the input. This was the key insight of ResNet (2015), and it is why we can train networks with dozens or hundreds of layers. There is also a gradient perspective: during backpropagation, the gradient has a "highway" through the addition operation, flowing directly from later layers to earlier ones without passing through any transformations that could distort it.
-
-<Callout type="info" title="Why layer normalization?">
-  <p>As data flows through many layers of transformations, the distribution of activations can drift -- values might grow very large or very small, making training unstable. Layer normalization re-centers (subtracts mean) and re-scales (divides by standard deviation) the activations at each layer, keeping them in a well-behaved range. Why LayerNorm instead of BatchNorm (which normalizes across the batch dimension)? BatchNorm computes statistics across the batch, which means its behavior changes depending on what other examples happen to be in the batch -- problematic for sequences of varying length. LayerNorm normalizes across the feature dimension within each individual example, so it is self-contained and consistent regardless of batch composition. This makes it the standard choice for transformers.</p>
+<Callout type="info" title="What's dropout doing in there?">
+  <p>You will notice <code>nn.Dropout</code> sprinkled through Head, MultiHeadAttention, and FeedForward. Randomly zeroing activations during training sounds destructive, but it is a powerful regularization technique. It forces the network to be robust -- no single neuron can become a critical point of failure because it might be dropped at any time. The network learns redundant representations. At test time (after <code>model.eval()</code>), dropout is disabled and all neurons are active, so you get the full model. Think of it like training a team where random members are absent each day -- the team learns to function without relying on any one person.</p>
 </Callout>
-
-**Positional embeddings**: This one is subtle but critical. Attention is *permutation-invariant* by default. If you shuffle the order of the input positions, the attention mechanism would produce the same output (just shuffled). That means without positional information, the model literally cannot distinguish `"cat"` from `"tac"` -- it sees the same set of characters and computes the same relationships. Position 1 and position 5 are identical to the attention mechanism. Positional embeddings break this symmetry by adding a unique learned vector to each position, so the model knows *where* each character sits in the sequence.
-
-**The feed-forward network after attention**: Attention is good at one thing -- mixing information across positions. But the mixing is essentially linear in the values (it is a weighted sum). The feed-forward network (FFN) adds per-position nonlinear processing power. Think of attention as "gather relevant information from context" and the FFN as "process that gathered information into something useful." The 4x expansion (`n_embd` to `4 * n_embd` back to `n_embd`) gives the FFN a wider intermediate layer with more capacity to learn complex transformations before projecting back down. This bottleneck-expand-compress pattern is a common design in deep learning.
-
-**Dropout**: Randomly zeroing out activations during training sounds destructive, but it is a powerful regularization technique. It forces the network to be robust -- no single neuron can become a critical point of failure because it might be dropped at any time. The network learns redundant representations. At test time, all neurons are active (and scaled accordingly), so you get the full model. Think of it like training a team where random members are absent each day -- the team learns to function without relying on any one person.
 
 <Callout type="warning" title="GPU recommended">
   <p>The full transformer has around 50,000 parameters and trains for 10,000 steps. This will take a minute or two on a CPU. On a GPU (free tier on Colab), it takes seconds. If you are following along locally without a GPU, reduce <code>n_layer</code> to 2 and <code>max_steps</code> to 5000.</p>
 </Callout>
 
-Now let us prepare the data for the transformer (it expects a different format than the MLP) and train it:
+## Preparing the data: how transformer input differs from the MLP
+
+The transformer eats a very different kind of input than the MLP, and it is worth slowing down to see exactly how. Three things change:
+
+1. **Context length.** The MLP saw 3 characters at a time (`block_size = 3`). The transformer sees 16 (`block_size = 16`).
+2. **Shape and abstraction.** The MLP's input was a *flat* tensor of shape `(B, block_size · n_embd)` -- the embeddings of all 3 characters concatenated into one long vector, with no notion of "position 1 vs position 2." The transformer's input is a *sequence* tensor of shape `(B, T, n_embd)` -- the model treats the time axis as a first-class dimension and uses attention + positional embeddings to reason about ordering.
+3. **Padding.** Because the transformer always expects exactly `block_size` time steps, contexts shorter than that get **left-padded** with the start token (`0`). When predicting the very first character of a name, the input is `[0, 0, …, 0]` -- 16 padding tokens -- and the target is whatever character starts the name.
+
+Concretely, here is how the same name `"emma"` becomes training examples for each model:
+
+<div className="not-prose my-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+  <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-4 bg-zinc-50 dark:bg-zinc-800/40">
+    <div className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-2">MLP &nbsp;<span className="font-mono normal-case">(block_size = 3)</span></div>
+    <table className="text-xs font-mono w-full">
+      <thead className="text-zinc-500 text-left"><tr><th className="py-1 pr-3">context</th><th>target</th></tr></thead>
+      <tbody>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, 0]</td><td className="text-emerald-600 dark:text-emerald-400">5 (e)</td></tr>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, 5]</td><td className="text-emerald-600 dark:text-emerald-400">13 (m)</td></tr>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 5, 13]</td><td className="text-emerald-600 dark:text-emerald-400">13 (m)</td></tr>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[5, 13, 13]</td><td className="text-emerald-600 dark:text-emerald-400">1 (a)</td></tr>
+      </tbody>
+    </table>
+    <p className="text-[11px] text-zinc-500 mt-2">Each example: 3 ints in, 1 int out. <span className="font-mono">X.shape = (N, 3)</span></p>
+  </div>
+  <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-4 bg-zinc-50 dark:bg-zinc-800/40">
+    <div className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-2">Transformer &nbsp;<span className="font-mono normal-case">(block_size = 16)</span></div>
+    <table className="text-xs font-mono w-full">
+      <thead className="text-zinc-500 text-left"><tr><th className="py-1 pr-3">context (left-padded)</th><th>target</th></tr></thead>
+      <tbody>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0]</td><td className="text-emerald-600 dark:text-emerald-400">5 (e)</td></tr>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0, 5]</td><td className="text-emerald-600 dark:text-emerald-400">13 (m)</td></tr>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0, 5, 13]</td><td className="text-emerald-600 dark:text-emerald-400">13 (m)</td></tr>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0, 5, 13, 13]</td><td className="text-emerald-600 dark:text-emerald-400">1 (a)</td></tr>
+      </tbody>
+    </table>
+    <p className="text-[11px] text-zinc-500 mt-2">Each example: 16 ints in, 1 int out. <span className="font-mono">X.shape = (N, 16)</span></p>
+  </div>
+</div>
+
+The data prep walks every name and produces one training example per next-character prediction, padding contexts on the left when they are shorter than `block_size`:
 
 <CodeBlock title="transformer_data.py" language="python">{`# Build dataset for the transformer
 def build_transformer_dataset(words):
-    """Each name becomes a padded sequence of character indices."""
+    """Each (context, target) pair becomes a left-padded sequence of length block_size."""
     X, Y = [], []
     for w in words:
         chs = [0] + [stoi[ch] for ch in w] + [0]  # wrap with start/end tokens
@@ -762,7 +841,7 @@ def build_transformer_dataset(words):
 
 X_train_t, Y_train_t = build_transformer_dataset(train_words)
 X_val_t, Y_val_t = build_transformer_dataset(val_words)
-print(f"Transformer training examples: {X_train_t.shape}")`}</CodeBlock>
+print(f"Transformer training examples: {X_train_t.shape}")  # (N, 16)`}</CodeBlock>
 
 <CodeBlock title="transformer_train.py" language="python">{`# Initialize and train
 model = NameTransformer()
