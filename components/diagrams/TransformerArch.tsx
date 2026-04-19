@@ -35,7 +35,7 @@ export function TransformerArch() {
   const blockItems: (Box & { kind: "node" | "add" })[] = [
     // Bottom of block first
     { id: "ln1",  kind: "node", label: "LayerNorm",          sub: "ln1",                   color: "#a1a1aa" },
-    { id: "mha",  kind: "node", label: "Multi-Head Attention", sub: "n_head heads × head_size", color: "#7c3aed" },
+    { id: "mha",  kind: "node", label: "Multi-Head Attention", sub: "softmax(Q·Kᵀ / √d) · V  ×  n_head", color: "#7c3aed" },
     { id: "add1", kind: "add",  label: "+",                  sub: "residual",              color: "#10b981" },
     { id: "ln2",  kind: "node", label: "LayerNorm",          sub: "ln2",                   color: "#a1a1aa" },
     { id: "ffn",  kind: "node", label: "Feed Forward",       sub: "Linear → ReLU → Linear", color: "#f59e0b" },
@@ -173,6 +173,33 @@ export function TransformerArch() {
             animate={{ opacity: 1 }}
             transition={{ duration: 0.5, delay: 0.6 }}
           />
+
+          {/* Sub-layer grouping: thin left-edge accent bar marking what each residual bypasses */}
+          {(() => {
+            const ln1 = itemAt.get("ln1")!;
+            const mha = itemAt.get("mha")!;
+            const ln2 = itemAt.get("ln2")!;
+            const ffn = itemAt.get("ffn")!;
+            const groups = [
+              { top: mha.y - 3, bottom: ln1.y + ln1.h + 3, color: "#7c3aed" },
+              { top: ffn.y - 3, bottom: ln2.y + ln2.h + 3, color: "#f59e0b" },
+            ];
+            const barX = cx - boxW / 2 - 7;
+            return groups.map((g, i) => (
+              <motion.rect
+                key={`group-${i}`}
+                x={barX}
+                y={g.top}
+                width={3}
+                height={g.bottom - g.top}
+                rx={1.5}
+                fill={g.color}
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 0.55 }}
+                transition={{ duration: 0.5, delay: 0.7 + i * 0.1 }}
+              />
+            ));
+          })()}
           {/* xN badge — to the far right, beyond the residual arc */}
           <motion.g
             initial={{ opacity: 0, scale: 0.9 }}
@@ -273,6 +300,10 @@ export function TransformerArch() {
             const isAdd = "kind" in item && (item as any).kind === "add";
             if (isAdd) {
               const r = pos.h / 2;
+              const formula =
+                item.id === "add1"
+                  ? ["x", "+ sa(ln1(x))"]
+                  : ["x", "+ ffwd(ln2(x))"];
               return (
                 <motion.g
                   key={item.id}
@@ -299,14 +330,27 @@ export function TransformerArch() {
                   >
                     +
                   </text>
+                  {/* Formula label to the left of + */}
+                  <text
+                    x={cx - r - 6}
+                    y={pos.centerY - 1}
+                    textAnchor="end"
+                    className="fill-emerald-600 dark:fill-emerald-400"
+                    fontSize="10"
+                    fontFamily="monospace"
+                    fontWeight={600}
+                  >
+                    {formula[0]}
+                  </text>
                   <text
                     x={cx + r + 6}
-                    y={pos.centerY + 4}
+                    y={pos.centerY - 1}
                     className="fill-emerald-600 dark:fill-emerald-400"
-                    fontSize="9"
-                    fontStyle="italic"
+                    fontSize="10"
+                    fontFamily="monospace"
+                    fontWeight={600}
                   >
-                    residual
+                    {formula[1]}
                   </text>
                 </motion.g>
               );
