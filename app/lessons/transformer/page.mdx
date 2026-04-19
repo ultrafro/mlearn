@@ -4,6 +4,7 @@ import { Callout } from "@/components/ui/Callout"
 import { BigramHeatmap } from "@/components/diagrams/BigramHeatmap"
 import { MLPForwardPass } from "@/components/diagrams/MLPForwardPass"
 import { AttentionMatrix } from "@/components/diagrams/AttentionMatrix"
+import { QKVMatrixViz } from "@/components/diagrams/QKVMatrixViz"
 import { TransformerArch } from "@/components/diagrams/TransformerArch"
 import { LossCurve } from "@/components/diagrams/LossCurve"
 
@@ -479,6 +480,10 @@ Then we use these attention weights to combine the **values**. The value at posi
 ### From intuition to math
 
 Each of Q, K, and V is produced by a learned linear projection of the position's embedding. If `x` is the embedding (shape `C`), then `q = x @ W_q`, `k = x @ W_k`, `v = x @ W_v`, where `W_q`, `W_k`, `W_v` are learnable matrices of shape `(C, head_size)`. Three matrices, three roles -- and the model learns all three from data via gradient descent.
+
+Stacking all `T` positions of the sequence into a single matrix `X` (shape `T × C`), we get all the queries, keys, and values for the whole sequence in one matmul each: `Q = X @ W_q`, `K = X @ W_k`, `V = X @ W_v`. The visualizer below walks through this computation cell-by-cell -- toggle Q, K, V to see the *same* input X being projected three different ways, and drag the sliders to see how the shapes change with sequence length, embedding dim, and head size.
+
+<QKVMatrixViz />
 
 Attention scores are computed by taking the dot product of queries with keys. If a query and key point in similar directions (high dot product), that position gets more attention. We then softmax these scores into a probability distribution and use them as weights for a sum over values. In one line: `output = softmax(Q @ K.T / sqrt(d)) @ V`.
 
