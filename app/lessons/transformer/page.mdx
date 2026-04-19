@@ -440,11 +440,54 @@ Let us build the intuition with three concepts:
 - **Key (K)**: "What do I contain?" -- Each position also creates a key vector.
 - **Value (V)**: "What will I share if someone attends to me?" -- The actual information to pass along.
 
+### A library analogy
+
+Imagine you walk into a library looking for information. You have a **question in your head** (your query). Every book on the shelves has a **title and topic on the spine** (its key) -- a short advertisement of what it contains. You scan the spines, and the books whose topics best match your question are the ones you pull off the shelf. But the title is not what you actually read -- once you pull a book down, you read the **contents inside** (its value).
+
+That is exactly what self-attention does at every position in the sequence:
+
+1. Each position forms a query: "What kind of context would help me predict the next character?"
+2. Every position (including itself) advertises a key: "Here is what I am, in a form designed to be matched against queries."
+3. The query is compared against every key (via dot product). High match = high attention.
+4. Each position also has a value: the actual information it will contribute. We take a weighted average of all values, weighted by how well each key matched our query.
+
+The crucial design choice: a position's key (how it advertises itself) is *different* from its value (what it actually contributes). The library's spine summary is not the same as the book's contents. This separation lets the model learn very different things for the two roles.
+
+### A concrete example: predicting the next character in "alexandr"
+
+Suppose the model has read `a-l-e-x-a-n-d-r` and is about to predict the next character. The position holding `r` (position 8) needs to decide what comes next. A human seeing this would think `"a"` -- because we have seen `"alex"` and `"andr"` before, and the `"andr-"` pattern often ends in `"-a"` (alexandra, sandra, cassandra).
+
+How does self-attention figure this out? The `r` at position 8 builds a **query** vector. Conceptually, this query might encode something like: *"I am a consonant following 'and'. I want to know about the broader name structure -- specifically, what vowels appeared earlier and whether this looks like a feminine ending pattern."* (The model never literally writes that down -- it learns a high-dimensional vector that, through training, has come to mean something like that.)
+
+Now every earlier position (1 through 8) has already built a **key**. Each key is that position's "spine summary":
+
+- Position 1 (`a`): "I am a name-initial vowel"
+- Position 2 (`l`): "I am an early consonant after a vowel"
+- Position 3 (`e`): "I am a vowel in position 3"
+- Position 4 (`x`): "I am the rare consonant 'x'"
+- Position 5 (`a`): "I am a vowel after 'x'"
+- ...and so on
+
+The query from position 8 is dot-producted with every one of these keys. Suppose the dot products come out to `[0.2, 0.1, 0.3, 2.1, 0.4, 1.8, 1.5, 0.9]`. After softmax, position 8 ends up paying most of its attention to positions 4 (`x`), 6 (`n`), and 7 (`d`) -- the distinctive consonants that define this name's structure.
+
+Then we use these attention weights to combine the **values**. The value at position 4 is not the spine "I am the letter x" -- it is the rich information *the model actually wants to pass forward*, which might be something like: *"a rare consonant has appeared, biasing toward names like alexander/alexandra."* Position 8 sums up all these values, weighted by attention, and uses the result to predict the next character.
+
 <Callout type="info" title="Why separate Q, K, and V? Why not just use embeddings directly?">
   <p>You might wonder: why not just take the dot product of the raw embeddings to compute attention? The separation into queries, keys, and values lets the model learn different roles for the same position. The query projection learns &quot;what am I looking for?&quot; while the key projection learns &quot;what do I advertise to others?&quot; and the value projection learns &quot;what information do I actually share?&quot; These can be very different. The letter &apos;a&apos; at position 5 might be looking for a preceding consonant (its query) while advertising that it is a vowel (its key) and sharing its specific identity (its value). Without this separation, you would be forced to use the same representation for all three roles, which severely limits what the model can learn.</p>
 </Callout>
 
-Attention scores are computed by taking the dot product of queries with keys. If a query and key are similar (high dot product), that position gets more attention. Then we use these scores to compute a weighted sum of values.
+### From intuition to math
+
+Each of Q, K, and V is produced by a learned linear projection of the position's embedding. If `x` is the embedding (shape `C`), then `q = x @ W_q`, `k = x @ W_k`, `v = x @ W_v`, where `W_q`, `W_k`, `W_v` are learnable matrices of shape `(C, head_size)`. Three matrices, three roles -- and the model learns all three from data via gradient descent.
+
+Attention scores are computed by taking the dot product of queries with keys. If a query and key point in similar directions (high dot product), that position gets more attention. We then softmax these scores into a probability distribution and use them as weights for a sum over values. In one line: `output = softmax(Q @ K.T / sqrt(d)) @ V`.
+
+A few things to keep in mind as you read the code below:
+
+- The same input `x` is fed into all three projections. Q, K, V are *different views* of the same sequence.
+- `Q @ K.T` produces a `(T, T)` matrix -- one attention score per pair of positions. Row `i` tells you how much position `i` attends to every other position.
+- After the softmax, each row sums to 1 -- so each position's output is a true weighted average of values.
+- The causal mask (next callout) zeros out the upper triangle so positions cannot peek into the future.
 
 <CodeBlock title="attention.py" language="python">{`# Single-head self-attention from scratch
 import torch
