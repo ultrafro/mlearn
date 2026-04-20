@@ -239,11 +239,13 @@ export function TransformerArch() {
             </text>
           </motion.g>
 
-          {/* Flow lines with arrowheads */}
+          {/* Flow lines with arrowheads (pointing UP, in the direction of data flow) */}
           {flowOrder.slice(0, -1).map((fromId, idx) => {
             const toId = flowOrder[idx + 1];
             const from = itemAt.get(fromId)!;
             const to = itemAt.get(toId)!;
+            // Draw line in data-flow direction: from source-top to dest-bottom (upward in SVG y).
+            // Use markerEnd with auto orient so the arrowhead lands at the dest and points up.
             return (
               <motion.line
                 key={`flow-${idx}`}
@@ -253,7 +255,7 @@ export function TransformerArch() {
                 y2={to.y + to.h}
                 className="stroke-zinc-400 dark:stroke-zinc-500"
                 strokeWidth={1.6}
-                markerStart="url(#arrowhead)"
+                markerEnd="url(#arrowhead)"
                 initial={{ pathLength: 0, opacity: 0 }}
                 animate={{ pathLength: 1, opacity: 1 }}
                 transition={{ duration: 0.4, delay: 0.05 * idx }}
