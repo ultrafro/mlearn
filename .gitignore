@@ -36,6 +36,11 @@ yarn-error.log*
 # vercel
 .vercel
 
+# notebook local data cache (downloaded at runtime from public/)
+notebooks/names.txt
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+.vercel

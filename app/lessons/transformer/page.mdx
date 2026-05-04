@@ -782,11 +782,12 @@ The outer model wires up the input embeddings, the stack of `n_layer` Blocks, a 
 
 ## Preparing the data: how transformer input differs from the MLP
 
-The transformer eats a very different kind of input than the MLP, and it is worth slowing down to see exactly how. Three things change:
+The transformer eats a very different kind of input than the MLP, and it is worth slowing down to see exactly how. Four things change:
 
 1. **Context length.** The MLP saw 3 characters at a time (`block_size = 3`). The transformer sees 16 (`block_size = 16`).
 2. **Shape and abstraction.** The MLP's input was a *flat* tensor of shape `(B, block_size · n_embd)` -- the embeddings of all 3 characters concatenated into one long vector, with no notion of "position 1 vs position 2." The transformer's input is a *sequence* tensor of shape `(B, T, n_embd)` -- the model treats the time axis as a first-class dimension and uses attention + positional embeddings to reason about ordering.
 3. **Padding.** Because the transformer always expects exactly `block_size` time steps, contexts shorter than that get **left-padded** with the start token (`0`). When predicting the very first character of a name, the input is `[0, 0, …, 0]` -- 16 padding tokens -- and the target is whatever character starts the name.
+4. **Targets at every position.** The MLP gets one prediction per example. The transformer makes a prediction at *every* position in the sequence in parallel, so the targets are themselves a `block_size`-long sequence (the inputs shifted by one). Padded positions get the sentinel value `-100` so cross-entropy ignores them.
 
 Concretely, here is how the same name `"emma"` becomes training examples for each model:
 
@@ -807,41 +808,45 @@ Concretely, here is how the same name `"emma"` becomes training examples for eac
   <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-4 bg-zinc-50 dark:bg-zinc-800/40">
     <div className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-2">Transformer &nbsp;<span className="font-mono normal-case">(block_size = 16)</span></div>
     <table className="text-xs font-mono w-full">
-      <thead className="text-zinc-500 text-left"><tr><th className="py-1 pr-3">context (left-padded)</th><th>target</th></tr></thead>
+      <thead className="text-zinc-500 text-left"><tr><th className="py-1 pr-3">input (left-padded)</th><th>targets at every position</th></tr></thead>
       <tbody>
-        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0]</td><td className="text-emerald-600 dark:text-emerald-400">5 (e)</td></tr>
-        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0, 5]</td><td className="text-emerald-600 dark:text-emerald-400">13 (m)</td></tr>
-        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0, 5, 13]</td><td className="text-emerald-600 dark:text-emerald-400">13 (m)</td></tr>
-        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0, 5, 13, 13]</td><td className="text-emerald-600 dark:text-emerald-400">1 (a)</td></tr>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0]</td><td className="text-emerald-600 dark:text-emerald-400">[-100, …, -100, 5]</td></tr>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0, 5]</td><td className="text-emerald-600 dark:text-emerald-400">[-100, …, -100, 5, 13]</td></tr>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0, 5, 13]</td><td className="text-emerald-600 dark:text-emerald-400">[-100, …, -100, 5, 13, 13]</td></tr>
+        <tr><td className="text-violet-600 dark:text-violet-400 py-0.5 pr-3">[0, 0, …, 0, 5, 13, 13]</td><td className="text-emerald-600 dark:text-emerald-400">[-100, …, -100, 5, 13, 13, 1]</td></tr>
       </tbody>
     </table>
-    <p className="text-[11px] text-zinc-500 mt-2">Each example: 16 ints in, 1 int out. <span className="font-mono">X.shape = (N, 16)</span></p>
+    <p className="text-[11px] text-zinc-500 mt-2">Each example: 16 ints in, 16 ints out (next char at each position; <span className="font-mono">-100</span> means "ignore"). <span className="font-mono">X.shape = Y.shape = (N, 16)</span></p>
   </div>
 </div>
 
-The data prep walks every name and produces one training example per next-character prediction, padding contexts on the left when they are shorter than `block_size`:
+The data prep walks every name and produces one training example per next-character prediction. Each example is a `block_size`-long input with a matching `block_size`-long sequence of targets — one target per position, so the transformer learns to predict at every step in parallel. Positions that fall before any real character are padded with the start token in the input and with `-100` in the targets so cross-entropy ignores them:
 
 <CodeBlock title="transformer_data.py" language="python">{`# Build dataset for the transformer
 def build_transformer_dataset(words):
-    """Each (context, target) pair becomes a left-padded sequence of length block_size."""
+    """Each example is (input_seq, target_seq) of length block_size.
+    Targets at padded positions are -100 so cross_entropy ignores them."""
     X, Y = [], []
     for w in words:
         chs = [0] + [stoi[ch] for ch in w] + [0]  # wrap with start/end tokens
         for i in range(len(chs) - 1):
-            context = chs[:i + 1]
-            target = chs[i + 1]
-            # Pad or crop context to block_size
-            if len(context) > block_size:
-                context = context[-block_size:]
-            else:
-                context = [0] * (block_size - len(context)) + context
-            X.append(context)
-            Y.append(target)
+            start = max(0, i - block_size + 1)
+            inp = chs[start:i + 1]      # context up to position i
+            tgt = chs[start + 1:i + 2]  # next-char target at every position
+            pad_len = block_size - len(inp)
+            inp = [0] * pad_len + inp        # pad inputs with the '.' token (id 0)
+            tgt = [-100] * pad_len + tgt     # -100 = ignore_index for cross_entropy
+            X.append(inp)
+            Y.append(tgt)
     return torch.tensor(X), torch.tensor(Y)
 
 X_train_t, Y_train_t = build_transformer_dataset(train_words)
 X_val_t, Y_val_t = build_transformer_dataset(val_words)
-print(f"Transformer training examples: {X_train_t.shape}")  # (N, 16)`}</CodeBlock>
+print(f"Transformer training examples: X={X_train_t.shape}, Y={Y_train_t.shape}")  # both (N, 16)`}</CodeBlock>
+
+<Callout type="info" title="Why -100 in the targets matters">
+  <p>If you padded the targets with <code>0</code> (the <code>.</code> token) instead of <code>-100</code>, you would be training the model to predict <code>.</code> any time it sees a sequence of <code>.</code>s. At sample time you start generation with a single <code>.</code> token — exactly the all-padding pattern — and the model would immediately predict <code>.</code> and stop. Validation loss would still look great because so many "easy" padded positions are trivial. Using <code>-100</code> tells <code>F.cross_entropy</code> to skip those positions entirely (it is the default <code>ignore_index</code>), so the loss reflects only real next-character predictions.</p>
+</Callout>
 
 <CodeBlock title="transformer_train.py" language="python">{`# Initialize and train
 model = NameTransformer()
@@ -870,7 +875,7 @@ for step in range(max_steps):
 # Final validation loss
 with torch.no_grad():
     _, val_loss = model(X_val_t[:1000], Y_val_t[:1000])
-print(f"Final validation loss: {val_loss.item():.4f}")  # ~1.6`}</CodeBlock>
+print(f"Final validation loss: {val_loss.item():.4f}")  # ~2.16 with these hyperparameters`}</CodeBlock>
 
 <Callout type="info" title="AdamW vs manual gradient descent">
   <p>For the bigram and MLP, we manually updated weights with <code>p.data -= lr * p.grad</code>. AdamW is a smarter optimizer that tracks the history of gradients and adapts the learning rate per-parameter. It is the standard choice for transformers. Think of it as the difference between hand-tuning CSS values and using a design system.</p>
@@ -897,29 +902,24 @@ for _ in range(20):
     print(''.join(out))`}</CodeBlock>
 
 ```
-alexandra
-michael
-jaden
-sophia
-terrence
-kaylin
-emilia
-brenton
-dariel
-savannah
-connor
-riley
-ariella
-marcus
-leona
-natalie
-dominic
-keira
-ashlyn
-carlos
+anuella
+idushan
+laylena
+mantella
+daziren
+regantle
+jaydevi
+lavithan
+marcell
+kamarior
+rocklynn
+juielle
+fridynn
+gilthenie
+anorelu
 ```
 
-Look at that. Real, plausible, diverse names. The transformer learned long-range dependencies that the MLP could not capture -- it knows that names starting with certain patterns tend to end in certain ways. It learned the *rhythm* of human names.
+Real, plausible, diverse names — and *novel*: none of these appear verbatim in the training set. The transformer learned the rhythm of human names well enough to invent new ones rather than memorizing the dataset. With more training steps or a deeper model the gap over the MLP widens further; with this small setup (2 layers, `n_embd=64`, 10k steps) it is a modest but real win.
 
 ## Comparing Models
 
@@ -939,10 +939,10 @@ Let us see how all four models stack up. The loss curve tells the story clearly:
     </thead>
     <tbody>
       {[
-        ["Bigram (counting)", "~2.45", "mnba, aia, rer", "729 (27×27 table)"],
-        ["Neural Bigram", "~2.47", "mnba, aia, rer", "729"],
-        ["MLP (block_size=3)", "~2.10", "delin, jara, sadie", "~6,000"],
-        ["Transformer", "~1.60", "alexandra, sophia, marcus", "~50,000"],
+        ["Bigram (counting)", "~2.46", "ah, cs, ian", "729 (27×27 table)"],
+        ["Neural Bigram", "~2.47", "ah, ade, cobrlir", "729"],
+        ["MLP (block_size=3)", "~2.20", "audrey, lillie, aria", "~12,000"],
+        ["Transformer", "~2.16", "anuella, laylena, jaydevi", "~104,000"],
       ].map(([model, loss, names, params], i) => (
         <tr key={model} className={`border-b border-zinc-200/60 dark:border-zinc-800/60 ${i === 3 ? "bg-violet-50/40 dark:bg-violet-900/10" : ""}`}>
           <td className={`px-4 py-2 ${i === 3 ? "font-semibold text-violet-700 dark:text-violet-300" : "text-zinc-700 dark:text-zinc-300"}`}>{model}</td>
@@ -959,7 +959,7 @@ The progression is clear:
 
 1. **Bigram and neural bigram** hit the same wall -- you cannot do better than ~2.45 with one character of context. The neural version just learned the same statistics a different way.
 2. **The MLP** made a big jump by using 3 characters of context. It learned common patterns like `"-lyn"`, `"-son"`, `"-ie"` endings.
-3. **The transformer** crushed it by dynamically attending to the most relevant parts of the context. It learned global name structure, not just local character patterns.
+3. **The transformer** edged out the MLP by dynamically attending to the most relevant parts of the context. The win is modest at this scale — only ~0.04 nats — but it scales with model size and training time in a way the MLP simply cannot. This is the architecture that, scaled up by a factor of ten thousand, becomes GPT.
 
 <Callout type="tip" title="What to explore next">
   <p>There is so much you can try from here. Increase the context window to 32 characters and see if the transformer improves further. Add temperature scaling to <code>generate()</code> to control how creative vs conservative the outputs are. Try training on a different dataset -- song lyrics, city names, Pokémon names. Implement beam search for better generation quality. Add character-level tokenization vs BPE and compare. The architecture you built here is the same one that powers GPT -- just smaller.</p>
